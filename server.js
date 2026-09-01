@@ -326,6 +326,23 @@ async function startSession(id) {
 
   sock.ev.on('creds.update', saveCreds)
 
+  // O push name (nome de perfil) de uma conta PESSOAL não vem pronto no
+  // momento em que a conexão abre — só contas Business recebem o nome já no
+  // pair-success (nó <biz>, ver Utils/validate-connection.js). Pra conta
+  // pessoal, o baileys só descobre o nome depois, quando uma mensagem
+  // fromMe:true volta com o atributo "notify" preenchido (sync
+  // multi-dispositivo) — nesse momento ele reemite 'creds.update' com
+  // { me: { ...creds.me, name } } (ver upsertMessage em Socket/chats.js).
+  // Sem este listener, entry.name (e a coluna "name") nunca são atualizados
+  // pra contas pessoais, mesmo depois de enviar mensagens.
+  sock.ev.on('creds.update', async (update) => {
+    if (update.me?.name && update.me.name !== entry.name) {
+      entry.name = update.me.name
+      await setSessionStatus(id, entry.status, entry.jid, entry.name)
+      console.log(`[${id}] nome de perfil atualizado: ${entry.name}`)
+    }
+  })
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
 
@@ -340,9 +357,10 @@ async function startSession(id) {
       entry.status = 'connected'
       entry.qr = null
       entry.jid = sock.user?.id ?? null
-      // sock.user.name é o push name (nome de perfil) que o próprio WhatsApp
-      // devolve nas creds ao conectar — não é algo que a bridge escolhe, vem
-      // pronto da conta do usuário.
+      // Só um snapshot inicial: pra conta Business o nome às vezes já vem
+      // pronto aqui. Pra conta pessoal normalmente ainda está undefined neste
+      // ponto — quem realmente captura o nome pra esse caso é o listener de
+      // 'creds.update' registrado acima (ver comentário lá).
       entry.name = sock.user?.name ?? null
       reconnectAttempts.set(id, 0)
       clearConnectingWatchdog(id)

@@ -1,0 +1,87 @@
+version: "3.7"
+
+services:
+  whatsapp_bridge_postgres:
+    image: postgres:16-alpine
+    networks:
+      - network_public
+    environment:
+      POSTGRES_USER: whatsapp_bridge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: whatsapp_bridge
+    volumes:
+      - whatsapp_bridge_postgres_data:/var/lib/postgresql/data
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        reservations:
+          cpus: "0.10"
+          memory: 128M
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  whatsapp_bridge_api:
+    image: justbrunasso/whatsapp-bridge:latest ## Versão do whatsapp-bridge
+    networks:
+      - network_public
+    depends_on:
+      - whatsapp_bridge_postgres
+    environment:
+      ## Servidor
+      - PORT=3000
+      - JSON_BODY_LIMIT=20mb
+      ## Banco de dados
+      - DATABASE_URL=postgres://whatsapp_bridge:${POSTGRES_PASSWORD}@whatsapp_bridge_postgres:5432/whatsapp_bridge
+      ## Autenticação (header x-api-key obrigatório em toda chamada)
+      - API_KEY=${API_KEY}
+      ## Reconexão automática após queda de conexão
+      - RECONNECT_MAX_ATTEMPTS=5
+      - RECONNECT_DELAY_MS=30000
+      ## Watchdog de sessão travada em "connecting"
+      - CONNECTING_TIMEOUT_MS=45000
+      ## Timeout de confirmação de status de mensagem enviada
+      - MESSAGE_STATUS_TIMEOUT_MS=8000
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        reservations:
+          cpus: "0.10"
+          memory: 128M
+        limits:
+          cpus: "0.5"
+          memory: 512M
+      labels:
+        - traefik.enable=1
+        - traefik.http.routers.whatsapp_bridge_api.rule=Host(`wsb.centrium.api.br`) ## Url da aplicação
+        - traefik.http.routers.whatsapp_bridge_api.entrypoints=websecure
+        - traefik.http.routers.whatsapp_bridge_api.priority=1
+        - traefik.http.routers.whatsapp_bridge_api.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.whatsapp_bridge_api.service=whatsapp_bridge_api
+        - traefik.http.services.whatsapp_bridge_api.loadbalancer.server.port=3000
+        - traefik.http.services.whatsapp_bridge_api.loadbalancer.passHostHeader=true
+
+volumes:
+  whatsapp_bridge_postgres_data:
+    external: true
+    name: whatsapp_bridge_postgres_data
+
+networks:
+  network_public:
+    name: network_public
+    external: true

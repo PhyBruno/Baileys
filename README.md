@@ -47,6 +47,7 @@ PORT=3000
 API_KEY=troque-por-uma-chave-forte      # obrigatória, o servidor não sobe sem ela
 RECONNECT_MAX_ATTEMPTS=5                # tentativas de reconexão automática após queda
 RECONNECT_DELAY_MS=30000                # espera fixa entre cada tentativa (30s)
+CONNECTING_TIMEOUT_MS=45000             # força /disconnect sozinho se travar em "connecting" (0 desativa)
 ```
 
 ### 3. Instalar e rodar
@@ -147,9 +148,18 @@ curl -X DELETE -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999
 
 `connecting` → `qr` (aguardando escaneamento) → `connected`
 `connected` → `disconnected` (via `/disconnect`, credenciais mantidas, **sem** reconexão automática)
+`connecting` → `disconnected` (travou em `connecting` por mais que `CONNECTING_TIMEOUT_MS` — watchdog força a saída, **sem** reconexão automática, igual a um `/disconnect` manual)
 `connected`/`qr` → `reconnecting` (queda de rede — não solicitada — tenta sozinho)
 `reconnecting` → `error` (desistiu após `RECONNECT_MAX_ATTEMPTS` tentativas — chame `/connect` de novo)
 qualquer → `logged_out` (deslogado pelo próprio WhatsApp ou via `DELETE`, credenciais apagadas)
+
+**Sessão travada em `connecting` ou `connected`?** Chame `/disconnect` e
+depois `/connect` — `/disconnect` funciona mesmo se o socket estiver morto/
+sem resposta (encerrar um socket já fechado é um no-op seguro). Se ficar em
+`connecting` por tempo demais sem digitar nada, o watchdog
+(`CONNECTING_TIMEOUT_MS`, default 45s) já faz isso sozinho — mas só o
+`/disconnect`, de propósito **não** reconecta em seguida (ver decisões de
+design abaixo).
 
 ## Decisões de design (e o que falta pra produção séria)
 
@@ -157,6 +167,15 @@ qualquer → `logged_out` (deslogado pelo próprio WhatsApp ou via `DELETE`, cre
   tentativas e delay fixo entre elas configuráveis via `RECONNECT_MAX_ATTEMPTS`
   e `RECONNECT_DELAY_MS`. Uma desconexão pedida via `/disconnect` ou `DELETE`
   nunca acorda reconexão sozinha — só volta se você chamar `/connect`.
+- **Watchdog de `connecting` travado** (`CONNECTING_TIMEOUT_MS`, default
+  45s): se o handshake com o WhatsApp nunca completar nem falhar (comum
+  atrás de firewall restritivo — o `connectTimeoutMs` interno do baileys só
+  conta a partir do WebSocket já aberto, não cobre um TCP travado antes
+  disso), a bridge força a saída sozinha. De propósito, essa ação é **só**
+  um `/disconnect` — não tenta reconectar em seguida. A ideia é não sair
+  batendo reconexão automática contra algo que pode ser estrutural (rede,
+  firewall) e entrar num loop; fica em `disconnected` esperando um
+  `/connect` explícito.
 - **Usa os utilitários oficiais do Baileys sempre que possível**, em vez de
   reimplementar: `makeCacheableSignalKeyStore` (cache em memória sobre as
   chaves de sessão, reduz leitura no Postgres — é o padrão recomendado pela

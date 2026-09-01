@@ -37,6 +37,22 @@ if (!Number.isFinite(RECONNECT_DELAY_MS) || RECONNECT_DELAY_MS < 0) {
   process.exit(1)
 }
 
+// Tempo máximo que uma sessão pode ficar em "connecting" sem nenhum sinal de
+// vida (sem virar "qr", "connected" ou nem sequer fechar com erro) antes da
+// bridge forçar a desconexão sozinha. Existe porque a abertura do socket do
+// baileys pode travar indefinidamente num TCP handshake que nunca completa
+// nem falha (comum atrás de firewall restritivo) — isso não é coberto pelo
+// connectTimeoutMs interno do baileys, que só conta a partir do WebSocket já
+// aberto. É só um "force disconnect", igual ao /disconnect manual: NÃO tenta
+// reconectar sozinho depois — fica em "disconnected" esperando um /connect.
+// 0 desativa o watchdog.
+const CONNECTING_TIMEOUT_MS = Number(process.env.CONNECTING_TIMEOUT_MS ?? 45_000)
+
+if (!Number.isFinite(CONNECTING_TIMEOUT_MS) || CONNECTING_TIMEOUT_MS < 0) {
+  console.error('ERRO: CONNECTING_TIMEOUT_MS precisa ser um número >= 0 (0 desativa o watchdog).')
+  process.exit(1)
+}
+
 // Formato aceito para o ID da sessão e para o destinatário de mensagens:
 // apenas dígitos, com DDI incluído (ex: 5511999999999). Nada de "+", espaço ou "-".
 const NUMBER_FORMAT = /^\d{8,15}$/
@@ -103,6 +119,29 @@ function clearReconnectTimer(id) {
   }
 }
 
+// Handle do watchdog de "connecting" travado, por sessão. Ver CONNECTING_TIMEOUT_MS acima.
+const connectingWatchdogs = new Map()
+
+function clearConnectingWatchdog(id) {
+  const timer = connectingWatchdogs.get(id)
+  if (timer) {
+    clearTimeout(timer)
+    connectingWatchdogs.delete(id)
+  }
+}
+
+// Mesma ação de um POST /disconnect manual: encerra o socket e marca a sessão
+// como "disconnected", sem agendar reconexão. Compartilhada entre a rota
+// /disconnect e o watchdog de connecting travado, pra não duplicar a lógica.
+async function forceDisconnect(id, entry) {
+  entry.intentionalDisconnect = true
+  clearReconnectTimer(id)
+  clearConnectingWatchdog(id)
+  entry.status = 'disconnected'
+  await setSessionStatus(id, 'disconnected')
+  entry.sock.end(undefined)
+}
+
 // Evita que duas chamadas concorrentes de /connect pro mesmo id criem dois
 // sockets ao mesmo tempo brigando pela mesma credencial no Postgres.
 // id -> Promise da chamada startSession() em andamento.
@@ -128,6 +167,7 @@ async function startSession(id) {
   // Qualquer reconexão agendada de uma queda anterior está obsoleta a partir
   // daqui — estamos iniciando a tentativa mais atual pra esta sessão.
   clearReconnectTimer(id)
+  clearConnectingWatchdog(id)
 
   await pool.query(
     `INSERT INTO wa_sessions (id, status) VALUES ($1, 'connecting')
@@ -188,6 +228,24 @@ async function startSession(id) {
   })
   entry.sock = sock
 
+  if (CONNECTING_TIMEOUT_MS > 0) {
+    connectingWatchdogs.set(
+      id,
+      setTimeout(async () => {
+        // Confere identidade (não só o id): se uma sessão mais nova já
+        // substituiu esta no meio do caminho, o watchdog desta é obsoleto.
+        const current = sessions.get(id)
+        if (current === entry && current.status === 'connecting') {
+          console.log(
+            `[${id}] "connecting" travado por mais de ${CONNECTING_TIMEOUT_MS}ms, ` +
+              'forçando desconexão (sem reconectar sozinho — chame /connect manualmente)'
+          )
+          await forceDisconnect(id, entry)
+        }
+      }, CONNECTING_TIMEOUT_MS)
+    )
+  }
+
   sock.ev.on('creds.update', saveCreds)
 
   sock.ev.on('connection.update', async (update) => {
@@ -196,6 +254,7 @@ async function startSession(id) {
     if (qr) {
       entry.qr = qr
       entry.status = 'qr'
+      clearConnectingWatchdog(id)
       await setSessionStatus(id, 'qr')
     }
 
@@ -204,11 +263,13 @@ async function startSession(id) {
       entry.qr = null
       entry.jid = sock.user?.id ?? null
       reconnectAttempts.set(id, 0)
+      clearConnectingWatchdog(id)
       await setSessionStatus(id, 'connected', entry.jid)
       console.log(`[${id}] conectado como ${entry.jid}`)
     }
 
     if (connection === 'close') {
+      clearConnectingWatchdog(id)
       if (entry.intentionalDisconnect) {
         entry.status = 'disconnected'
         await setSessionStatus(id, 'disconnected')
@@ -336,21 +397,15 @@ app.post('/sessions/:id/connect', async (req, res) => {
 })
 
 // Fecha a conexão mas MANTÉM as credenciais salvas — dá pra reconectar depois sem novo QR.
+// Também é o jeito de destravar manualmente uma sessão presa em "connecting"
+// (ou em qualquer outro estado): sock.end() num socket já morto é um no-op
+// seguro, então funciona mesmo se o socket já estiver travado/sem resposta.
 app.post('/sessions/:id/disconnect', async (req, res) => {
   const id = normalizeNumber(req.params.id)
   const entry = sessions.get(id)
   if (!entry) return res.status(404).json({ error: 'sessão não está ativa neste processo' })
 
-  entry.intentionalDisconnect = true
-  // Cobre o caso de pedir /disconnect enquanto a sessão está no meio de uma
-  // janela de reconexão automática (status "reconnecting", socket já
-  // fechado por uma queda anterior): sock.end() nesse socket já morto é um
-  // no-op e não dispara connection.update de novo, então sem isso o timer
-  // pendente ainda reconectaria sozinho mais tarde, ignorando o pedido.
-  clearReconnectTimer(id)
-  entry.status = 'disconnected'
-  await setSessionStatus(id, 'disconnected')
-  entry.sock.end(undefined) // fecha o socket sem invalidar as credenciais
+  await forceDisconnect(id, entry)
   res.json({ id, status: 'disconnecting' })
 })
 
@@ -394,6 +449,7 @@ app.delete('/sessions/:id', async (req, res) => {
     sessions.delete(id)
   }
   clearReconnectTimer(id)
+  clearConnectingWatchdog(id)
 
   await wipeAuthState(id)
   await pool.query('DELETE FROM wa_sessions WHERE id = $1', [id])

@@ -48,6 +48,8 @@ API_KEY=troque-por-uma-chave-forte      # obrigatória, o servidor não sobe sem
 RECONNECT_MAX_ATTEMPTS=5                # tentativas de reconexão automática após queda
 RECONNECT_DELAY_MS=30000                # espera fixa entre cada tentativa (30s)
 CONNECTING_TIMEOUT_MS=45000             # força /disconnect sozinho se travar em "connecting" (0 desativa)
+JSON_BODY_LIMIT=20mb                    # limite do body JSON (imagem/documento em base64 precisa de mais que o default de 100kb)
+MESSAGE_STATUS_TIMEOUT_MS=8000          # quanto tempo /messages espera pela confirmação real de entrega (0 desativa)
 ```
 
 ### 3. Instalar e rodar
@@ -115,7 +117,72 @@ Todos abaixo (exceto `/health`) exigem `x-api-key` no header.
 | GET    | `/sessions`                  | Lista todas as sessões (persistidas no banco) e seus status.               |
 | POST   | `/sessions/:id/disconnect`   | Fecha a conexão mas **mantém** as credenciais — reconecta sem novo QR.     |
 | DELETE | `/sessions/:id`              | Logout definitivo: invalida no WhatsApp e apaga as credenciais do banco.   |
-| POST   | `/sessions/:id/messages`     | Dispara mensagem: `{ "to": "5511988887777", "message": "oi" }`             |
+| POST   | `/sessions/:id/messages`     | Dispara mensagem — texto, imagem ou documento (ver formato abaixo).        |
+
+### Enviando texto, imagem ou documento
+
+`POST /sessions/:id/messages` aceita três formatos de corpo, selecionados pelo
+campo `"type"` (default `"text"`, mantém compatibilidade total com o formato
+antigo):
+
+```jsonc
+// texto (default, "type" pode ser omitido)
+{ "to": "5511988887777", "message": "Olá!" }
+
+// imagem
+{
+  "to": "5511988887777",
+  "type": "image",
+  "mediaBase64": "<conteúdo em base64, com ou sem prefixo data:image/...;base64,>",
+  "mimetype": "image/png",   // opcional — o baileys detecta sozinho se omitido
+  "caption": "legenda opcional"
+}
+
+// documento
+{
+  "to": "5511988887777",
+  "type": "document",
+  "mediaBase64": "<conteúdo em base64>",
+  "mimetype": "application/pdf",   // obrigatório pro baileys em documentos
+  "fileName": "nota-fiscal.pdf",   // opcional, default "arquivo"
+  "caption": "legenda opcional"
+}
+```
+
+Mídia só entra **embutida no request** (`mediaBase64`) — de propósito não
+existe um `mediaUrl` que a bridge buscaria sozinha: isso abriria SSRF (fetch
+de URL arbitrária vinda de qualquer cliente que tenha a API key global). Se
+seu caso de uso precisar disso, considere um allowlist de domínios antes de
+implementar.
+
+O limite de tamanho do body JSON é `20mb` por padrão (configurável via
+`JSON_BODY_LIMIT` no `.env`) — o default do Express (100kb) não seria
+suficiente pra imagem/documento em base64.
+
+**A resposta confirma o status real da entrega, não só que a bridge aceitou o
+envio.** `sock.sendMessage()` do baileys resolve assim que a mensagem é
+repassada ao servidor do WhatsApp (relay) — isso sozinho não garante que ela
+chegou no destinatário. A rota espera até `MESSAGE_STATUS_TIMEOUT_MS`
+(default `8000`, configurável no `.env`) por uma confirmação real via evento
+`messages.update` antes de responder:
+
+```jsonc
+// confirmado pelo WhatsApp dentro do timeout
+{ "ok": true, "id": "3EB0...", "status": "server_ack" } // ou "delivery_ack" / "read" / "played"
+
+// o WhatsApp recusou/falhou a entrega (HTTP 502)
+{ "ok": false, "id": "3EB0...", "status": "error", "error": "..." }
+
+// estourou o timeout sem confirmação — NÃO é falha, só não deu tempo de saber
+{ "ok": true, "id": "3EB0...", "status": "unknown" }
+```
+
+Além disso, o `to` é validado contra o próprio WhatsApp via `sock.onWhatsApp()`
+antes de enviar — números brasileiros têm o dígito "9" adicional ambíguo (a
+mesma conta pode estar registrada com ou sem ele), e montar o JID direto dos
+dígitos que o cliente mandou podia resultar num envio "bem sucedido" (`ok:
+true`) que na verdade ia pra um JID que não existe. Se o número não estiver
+registrado no WhatsApp, a resposta é `404`.
 
 ### Exemplo de uso
 
@@ -132,6 +199,11 @@ curl -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/qr
 curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/messages \
   -H "Content-Type: application/json" \
   -d '{"to": "5511988887777", "message": "Olá!"}'
+
+# 3b. dispara imagem (ver "Enviando texto, imagem ou documento" acima pro formato de documento)
+curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/messages \
+  -H "Content-Type: application/json" \
+  -d '{"to": "5511988887777", "type": "image", "mediaBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "mimetype": "image/png", "caption": "teste"}'
 
 # 4. desconecta sem perder a sessão (dá pra reconectar depois sem novo QR,
 #    e NÃO aciona reconexão automática — foi um pedido manual)

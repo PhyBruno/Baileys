@@ -7,7 +7,8 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-  Browsers
+  Browsers,
+  WAMessageStatus
 } from 'baileys'
 import { pool, migrate } from './db.js'
 import { usePostgresAuthState, wipeAuthState } from './postgresAuthState.js'
@@ -53,6 +54,69 @@ if (!Number.isFinite(CONNECTING_TIMEOUT_MS) || CONNECTING_TIMEOUT_MS < 0) {
   process.exit(1)
 }
 
+// Limite de tamanho do body JSON aceito pela API. O default do express
+// (100kb) é insuficiente pra imagem/documento em base64 (que já infla ~33%
+// o tamanho do binário original) — sem aumentar isso, todo envio de mídia
+// real seria rejeitado com 413 antes de chegar na validação da rota.
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '20mb'
+
+// sock.sendMessage() resolve assim que a mensagem é repassada pro servidor do
+// WhatsApp (relay) — não quando o destinatário recebe de verdade. O status
+// real (aceito pelo servidor, entregue no aparelho, ou erro) chega depois,
+// de forma assíncrona, via evento 'messages.update'. Pra devolver isso na
+// mesma resposta HTTP do POST /messages, esperamos até esse tempo por uma
+// atualização de status antes de responder. 0 desativa a espera (responde
+// assim que sendMessage() resolver, sem aguardar confirmação).
+const MESSAGE_STATUS_TIMEOUT_MS = Number(process.env.MESSAGE_STATUS_TIMEOUT_MS ?? 8_000)
+
+if (!Number.isFinite(MESSAGE_STATUS_TIMEOUT_MS) || MESSAGE_STATUS_TIMEOUT_MS < 0) {
+  console.error('ERRO: MESSAGE_STATUS_TIMEOUT_MS precisa ser um número >= 0 (0 desativa a espera).')
+  process.exit(1)
+}
+
+// Nomes legíveis pro enum numérico do baileys (ERROR=0, PENDING=1,
+// SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5), pra devolver na API em vez
+// do número cru.
+const MESSAGE_STATUS_NAMES = Object.fromEntries(
+  Object.entries(WAMessageStatus).map(([name, value]) => [value, name.toLowerCase()])
+)
+
+// Espera por uma atualização de status (via 'messages.update') pra uma
+// mensagem específica, até timeoutMs. Resolve assim que chegar ERROR (falha
+// confirmada) ou qualquer status >= SERVER_ACK (servidor confirmou o
+// recebimento — não esperamos até DELIVERY_ACK/READ porque isso pode nunca
+// chegar se o destinatário ficar offline, e não é isso que essa API promete).
+// Se estourar o timeout sem nenhuma atualização, resolve com null — isso NÃO
+// significa falha, só que não deu tempo de confirmar (a mensagem já foi
+// aceita pelo relay antes desta função ser chamada).
+function waitForMessageStatus(sock, messageId, timeoutMs) {
+  if (timeoutMs <= 0) return Promise.resolve(null)
+
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (status) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      sock.ev.off('messages.update', onUpdate)
+      resolve(status)
+    }
+
+    const onUpdate = (updates) => {
+      for (const { key, update } of updates) {
+        if (key.id !== messageId || typeof update.status !== 'number') continue
+        if (update.status === WAMessageStatus.ERROR || update.status >= WAMessageStatus.SERVER_ACK) {
+          finish(update.status)
+          return
+        }
+      }
+    }
+
+    const timer = setTimeout(() => finish(null), timeoutMs)
+    sock.ev.on('messages.update', onUpdate)
+  })
+}
+
 // Formato aceito para o ID da sessão e para o destinatário de mensagens:
 // apenas dígitos, com DDI incluído (ex: 5511999999999). Nada de "+", espaço ou "-".
 const NUMBER_FORMAT = /^\d{8,15}$/
@@ -90,6 +154,19 @@ async function resolveBaileysVersion() {
 
 function normalizeNumber(raw) {
   return String(raw).replace(/\D/g, '')
+}
+
+// Decodifica uma string base64 (aceita o prefixo opcional de data URL, ex:
+// "data:image/png;base64,...") pro Buffer que o baileys espera em
+// image/document. Retorna null se a string não for base64 válido ou vier
+// vazia — o chamador decide como responder (400), em vez desta função
+// lançar exceção pra um caso de erro totalmente esperado (input do cliente).
+function decodeBase64Media(raw) {
+  if (typeof raw !== 'string') return null
+  const commaIdx = raw.indexOf(',')
+  const cleaned = (raw.startsWith('data:') && commaIdx !== -1 ? raw.slice(commaIdx + 1) : raw).replace(/\s+/g, '')
+  if (cleaned.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned)) return null
+  return Buffer.from(cleaned, 'base64')
 }
 
 // Estado em memória das sessões vivas neste processo.
@@ -350,7 +427,7 @@ async function restorePersistedSessions() {
 // ---------------------- API ----------------------
 
 const app = express()
-app.use(express.json())
+app.use(express.json({ limit: JSON_BODY_LIMIT }))
 
 // Health check sem autenticação, útil pra load balancer / orquestrador.
 app.get('/health', (req, res) => res.json({ ok: true }))
@@ -462,18 +539,54 @@ app.delete('/sessions/:id', async (req, res) => {
   res.json({ id, status: 'removed' })
 })
 
-// Endpoint principal: dispara mensagem por uma sessão específica
+// Endpoint principal: dispara mensagem (texto, imagem ou documento) por uma
+// sessão específica. "type" default é "text", pra manter compatibilidade
+// total com o formato antigo { to, message }. Imagem/documento vão em
+// "mediaBase64" — de propósito NÃO existe um "mediaUrl" que o servidor
+// buscaria sozinho: isso seria SSRF (fetch de URL arbitrária vinda de
+// qualquer cliente que tenha a API key global), então mídia só entra
+// embutida no próprio request.
 app.post('/sessions/:id/messages', async (req, res) => {
   const id = normalizeNumber(req.params.id)
-  const { to, message } = req.body
+  const { to, message, type = 'text', mediaBase64, mimetype, fileName, caption } = req.body
 
-  if (!to || !message) {
-    return res.status(400).json({ error: 'informe "to" e "message" no corpo' })
+  if (!to) {
+    return res.status(400).json({ error: 'informe "to" no corpo' })
   }
   if (!NUMBER_FORMAT.test(normalizeNumber(to))) {
     return res.status(400).json({
       error: 'formato de "to" inválido. Use apenas dígitos com DDI, ex: 5511999999999'
     })
+  }
+  if (!['text', 'image', 'document'].includes(type)) {
+    return res.status(400).json({ error: 'campo "type" inválido. Use "text" (default), "image" ou "document".' })
+  }
+
+  let content
+  if (type === 'text') {
+    if (!message) {
+      return res.status(400).json({ error: 'informe "message" no corpo (obrigatório quando "type" é "text")' })
+    }
+    content = { text: message }
+  } else {
+    if (!mediaBase64) {
+      return res.status(400).json({ error: `informe "mediaBase64" no corpo (obrigatório quando "type" é "${type}")` })
+    }
+    const buffer = decodeBase64Media(mediaBase64)
+    if (!buffer || buffer.length === 0) {
+      return res.status(400).json({ error: '"mediaBase64" inválido ou vazio (aceita base64 puro ou data URL "data:<mime>;base64,...")' })
+    }
+
+    if (type === 'document') {
+      // mimetype é obrigatório pro baileys aqui (diferente de "image", que
+      // detecta sozinho se omitido) — ver AnyMediaMessageContent no pacote.
+      if (!mimetype) {
+        return res.status(400).json({ error: 'informe "mimetype" no corpo (obrigatório quando "type" é "document")' })
+      }
+      content = { document: buffer, mimetype, fileName: fileName || 'arquivo', caption: caption || undefined }
+    } else {
+      content = { image: buffer, caption: caption || undefined, ...(mimetype ? { mimetype } : {}) }
+    }
   }
 
   const entry = sessions.get(id)
@@ -483,8 +596,22 @@ app.post('/sessions/:id/messages', async (req, res) => {
   }
 
   try {
-    const jid = `${normalizeNumber(to)}@s.whatsapp.net`
-    const result = await entry.sock.sendMessage(jid, { text: message })
+    // Não confiamos no formato de dígitos que o cliente mandou pra montar o
+    // JID na mão. Números brasileiros têm o "9" adicional ambíguo (uma conta
+    // pode estar registrada com ou sem ele, dependendo de quando/como foi
+    // cadastrada) — montar "${numero}@s.whatsapp.net" direto manda pra um JID
+    // que pode não existir de verdade. O Baileys não valida isso no envio: ele
+    // aceita, criptografa e devolve um id de mensagem (result.key.id) mesmo
+    // pra um JID fantasma, então "ok: true" sozinho NÃO prova entrega.
+    // onWhatsApp() pergunta pro próprio servidor do WhatsApp qual é o JID
+    // canônico daquele número (é quem realmente sabe resolver o 9), então
+    // usamos o JID que ele devolve em vez do que construímos aqui.
+    const [resolved] = (await entry.sock.onWhatsApp(normalizeNumber(to))) || []
+    if (!resolved?.exists) {
+      return res.status(404).json({ error: `número "${to}" não está registrado no WhatsApp (ou não foi possível confirmar)` })
+    }
+
+    const result = await entry.sock.sendMessage(resolved.jid, content)
 
     // Alimenta o cache que o getMessage usa pra atender pedidos de retry do
     // WhatsApp (ver comentário em startSession). Cache limitado — só serve
@@ -497,7 +624,30 @@ app.post('/sessions/:id/messages', async (req, res) => {
       }
     }
 
-    res.json({ ok: true, id: result?.key?.id })
+    // sendMessage() já retornou (a mensagem foi repassada ao servidor do
+    // WhatsApp), mas isso não confirma entrega. Esperamos até
+    // MESSAGE_STATUS_TIMEOUT_MS por uma atualização de status real antes de
+    // responder — ver comentário de waitForMessageStatus.
+    const statusCode = result?.key?.id
+      ? await waitForMessageStatus(entry.sock, result.key.id, MESSAGE_STATUS_TIMEOUT_MS)
+      : null
+
+    if (statusCode === WAMessageStatus.ERROR) {
+      return res.status(502).json({
+        ok: false,
+        id: result?.key?.id,
+        status: 'error',
+        error: 'o WhatsApp recusou/falhou ao entregar esta mensagem (confirmado via messages.update)'
+      })
+    }
+
+    res.json({
+      ok: true,
+      id: result?.key?.id,
+      // 'unknown' quando o timeout estourou sem confirmação — não é falha,
+      // só significa que a entrega ainda não foi confirmada nesse tempo.
+      status: statusCode === null ? 'unknown' : MESSAGE_STATUS_NAMES[statusCode]
+    })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }

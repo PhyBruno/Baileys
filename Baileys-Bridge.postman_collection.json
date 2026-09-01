@@ -90,6 +90,46 @@
       "response": []
     },
     {
+      "name": "Send image",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"to\": \"{{toNumber}}\",\n  \"type\": \"image\",\n  \"mediaBase64\": \"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=\",\n  \"mimetype\": \"image/png\",\n  \"caption\": \"Imagem de teste via Postman\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/messages",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "messages"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Send document",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"to\": \"{{toNumber}}\",\n  \"type\": \"document\",\n  \"mediaBase64\": \"Q29udGV1ZG8gZGUgZXhlbXBsbyBkbyBkb2N1bWVudG8gZGUgdGVzdGUu\",\n  \"mimetype\": \"text/plain\",\n  \"fileName\": \"exemplo.txt\",\n  \"caption\": \"Documento de teste via Postman\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/messages",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "messages"]
+        }
+      },
+      "response": []
+    },
+    {
       "name": "Disconnect session",
       "request": {
         "method": "POST",

@@ -525,9 +525,22 @@ app.delete('/sessions/:id', async (req, res) => {
   if (entry) {
     entry.intentionalDisconnect = true
     try {
+      // logout() manda a stanza remove-companion-device pro WhatsApp e só
+      // fecha o socket (end()) DEPOIS disso ter ido pro ar. Se esse envio
+      // falhar/der timeout (rede instável, WhatsApp lento pra responder), a
+      // exceção não pode ficar só logada — sem o end() no finally abaixo, o
+      // socket ficava aberto e autenticado, ainda conectado de verdade ao
+      // WhatsApp, sem que ninguém tivesse mais referência pra fechá-lo (já
+      // saiu do "sessions" map): a API dizia "removed", mas o aparelho
+      // continuava na lista de "Aparelhos conectados" de verdade.
       await entry.sock.logout()
-    } catch {
-      // pode já estar desconectado, tudo bem
+    } catch (err) {
+      console.warn(`[${id}] logout() falhou (${err.message}) — fechando o socket localmente mesmo assim`)
+    } finally {
+      // Garantido mesmo se logout() já tiver fechado o socket com sucesso —
+      // end() num socket já encerrado é um no-op seguro (mesmo padrão do
+      // forceDisconnect/watchdog de "connecting" travado).
+      entry.sock.end(undefined)
     }
     sessions.delete(id)
   }
@@ -535,7 +548,15 @@ app.delete('/sessions/:id', async (req, res) => {
   clearConnectingWatchdog(id)
 
   await wipeAuthState(id)
-  await pool.query('DELETE FROM wa_sessions WHERE id = $1', [id])
+  const { rowCount } = await pool.query('DELETE FROM wa_sessions WHERE id = $1', [id])
+
+  // Sem sessão em memória E sem linha no banco: nunca existiu (ou já tinha
+  // sido removida antes). Antes disso a rota respondia "removed" sempre,
+  // mesmo pra um :id que nunca foi conectado — 404 é o resultado honesto.
+  if (!entry && rowCount === 0) {
+    return res.status(404).json({ error: 'sessão não encontrada' })
+  }
+
   res.json({ id, status: 'removed' })
 })
 

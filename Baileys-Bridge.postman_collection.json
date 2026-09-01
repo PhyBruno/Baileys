@@ -1,0 +1,123 @@
+{
+  "info": {
+    "name": "WhatsApp Bridge API (Baileys + Postgres)",
+    "description": "Collection de exemplo para a bridge Baileys clonada em C:\\repos\\Baileys. Fluxo: connect -> qr -> messages -> disconnect -> connect -> delete. Ajuste as variaveis apiKey/sessionId/toNumber conforme seu ambiente.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000", "type": "string" },
+    { "key": "apiKey", "value": "troque-por-uma-chave-forte", "type": "string" },
+    { "key": "sessionId", "value": "5511999999999", "type": "string" },
+    { "key": "toNumber", "value": "5511988887777", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["health"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "List sessions",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/sessions",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Connect session",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/connect",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "connect"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Get QR code",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/qr",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "qr"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Send message",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"to\": \"{{toNumber}}\",\n  \"message\": \"Ola! Mensagem de teste via Postman.\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/messages",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "messages"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Disconnect session",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/disconnect",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "disconnect"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Delete session (logout)",
+      "request": {
+        "method": "DELETE",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}"]
+        }
+      },
+      "response": []
+    }
+  ]
+}

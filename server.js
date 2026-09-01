@@ -386,8 +386,14 @@ app.post('/sessions/:id/connect', async (req, res) => {
     })
   }
 
+  // 'reconnecting' entra na mesma lista dos outros estados "ativos": a sessão
+  // já tem um socket em andamento (esperando o backoff de RECONNECT_DELAY_MS
+  // pra tentar de novo sozinha), então um /connect manual aqui não deve
+  // atropelar esse timer. Sem isso, um consumidor da API chamando /connect
+  // repetidamente sem checar o status martelava o WhatsApp com tentativas
+  // mais rápido do que o backoff configurado pretende.
   const existing = sessions.get(id)
-  if (existing && ['connected', 'connecting', 'qr'].includes(existing.status)) {
+  if (existing && ['connected', 'connecting', 'qr', 'reconnecting'].includes(existing.status)) {
     return res.json({ id, status: existing.status })
   }
 

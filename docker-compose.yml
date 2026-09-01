@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: whatsapp_bridge
+      POSTGRES_USER: whatsapp_bridge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U whatsapp_bridge -d whatsapp_bridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bridge:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://whatsapp_bridge:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}@postgres:5432/whatsapp_bridge
+      API_KEY: ${API_KEY:?defina API_KEY no .env}
+      PORT: 3000
+      RECONNECT_MAX_ATTEMPTS: ${RECONNECT_MAX_ATTEMPTS:-5}
+      RECONNECT_DELAY_MS: ${RECONNECT_DELAY_MS:-30000}
+    ports:
+      - "${PORT:-3000}:3000"
+
+volumes:
+  pgdata:

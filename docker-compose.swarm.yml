@@ -68,7 +68,7 @@ services:
           memory: 512M
       labels:
         - traefik.enable=1
-        - traefik.http.routers.whatsapp_bridge_api.rule=Host(`wsb.centrium.api.br`) ## Url da aplicação
+        - traefik.http.routers.whatsapp_bridge_api.rule=Host(`yoururl.com.br`) ## Url da aplicação
         - traefik.http.routers.whatsapp_bridge_api.entrypoints=websecure
         - traefik.http.routers.whatsapp_bridge_api.priority=1
         - traefik.http.routers.whatsapp_bridge_api.tls.certresolver=letsencryptresolver

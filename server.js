@@ -233,10 +233,10 @@ function startSessionSerialized(id) {
   return promise
 }
 
-async function setSessionStatus(id, status, jid = undefined) {
+async function setSessionStatus(id, status, jid = undefined, name = undefined) {
   await pool.query(
-    `UPDATE wa_sessions SET status = $2, jid = COALESCE($3, jid), updated_at = now() WHERE id = $1`,
-    [id, status, jid ?? null]
+    `UPDATE wa_sessions SET status = $2, jid = COALESCE($3, jid), name = COALESCE($4, name), updated_at = now() WHERE id = $1`,
+    [id, status, jid ?? null, name ?? null]
   )
 }
 
@@ -260,6 +260,7 @@ async function startSession(id) {
     status: 'connecting',
     qr: null,
     jid: null,
+    name: null,
     intentionalDisconnect: false,
     // Cache em memória, limitado, das últimas mensagens enviadas por esta sessão.
     // É o que alimenta o getMessage do baileys (ver comentário abaixo).
@@ -339,10 +340,14 @@ async function startSession(id) {
       entry.status = 'connected'
       entry.qr = null
       entry.jid = sock.user?.id ?? null
+      // sock.user.name é o push name (nome de perfil) que o próprio WhatsApp
+      // devolve nas creds ao conectar — não é algo que a bridge escolhe, vem
+      // pronto da conta do usuário.
+      entry.name = sock.user?.name ?? null
       reconnectAttempts.set(id, 0)
       clearConnectingWatchdog(id)
-      await setSessionStatus(id, 'connected', entry.jid)
-      console.log(`[${id}] conectado como ${entry.jid}`)
+      await setSessionStatus(id, 'connected', entry.jid, entry.name)
+      console.log(`[${id}] conectado como ${entry.jid} (${entry.name ?? 'sem nome de perfil'})`)
     }
 
     if (connection === 'close') {
@@ -511,7 +516,7 @@ app.get('/sessions/:id/qr', async (req, res) => {
 // Lista as sessões (persistidas no banco, não só as vivas neste processo)
 app.get('/sessions', async (req, res) => {
   const { rows } = await pool.query(
-    'SELECT id, status, jid, updated_at FROM wa_sessions ORDER BY updated_at DESC'
+    'SELECT id, status, jid, name, updated_at FROM wa_sessions ORDER BY updated_at DESC'
   )
   res.json(rows)
 })

@@ -8,10 +8,19 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   Browsers,
-  WAMessageStatus
+  WAMessageStatus,
+  generateWAMessageFromContent,
+  prepareWAMessageMedia
 } from 'baileys'
 import { pool, migrate } from './db.js'
 import { usePostgresAuthState, wipeAuthState } from './postgresAuthState.js'
+import {
+  LIST_BIZ_NODE,
+  BUTTONS_BIZ_NODE,
+  buildListMessage,
+  validateButtonsPayload,
+  buildButtonsMessage
+} from './interactive.js'
 
 const PORT = process.env.PORT || 3000
 const API_KEY = process.env.API_KEY
@@ -154,6 +163,93 @@ async function resolveBaileysVersion() {
 
 function normalizeNumber(raw) {
   return String(raw).replace(/\D/g, '')
+}
+
+// Campo "number" dos endpoints compatíveis com a Evolution: aceita só dígitos
+// com DDI (5511999999999) ou o JID de usuário (5511999999999@s.whatsapp.net,
+// com ou sem sufixo de dispositivo ":N"). Grupo (@g.us), @lid, broadcast etc.
+// ficam de fora de propósito — o fluxo de envio desta bridge é só conversa
+// individual. Sem essa checagem, normalizeNumber() transformaria um JID de
+// grupo em "dígitos" e ele passaria como se fosse um número. Retorna os
+// dígitos ou null.
+function parseRecipientNumber(raw) {
+  if (typeof raw !== 'string') return null
+  let user = raw.trim()
+  if (user.includes('@')) {
+    if (!user.endsWith('@s.whatsapp.net')) return null
+    user = user.slice(0, user.indexOf('@')).replace(/:\d+$/, '')
+  }
+  const digits = normalizeNumber(user)
+  return NUMBER_FORMAT.test(digits) ? digits : null
+}
+
+// Busca a sessão viva deste processo e confirma que ela está conectada. Em
+// caso de problema já responde (404/409) e retorna null.
+function getConnectedEntry(id, res) {
+  const entry = sessions.get(id)
+  if (!entry) {
+    res.status(404).json({ error: 'sessão não encontrada ou não ativa neste processo' })
+    return null
+  }
+  if (entry.status !== 'connected') {
+    res.status(409).json({ error: `sessão não está conectada (status: ${entry.status})` })
+    return null
+  }
+  return entry
+}
+
+// Alimenta o cache que o getMessage usa pra atender pedidos de retry do
+// WhatsApp (ver comentário em startSession). Cache limitado — só serve pra
+// cobrir um retry logo após o envio, não é histórico permanente.
+function cacheSentMessage(entry, messageId, message) {
+  if (!messageId || !message) return
+  entry.sentMessages.set(messageId, message)
+  if (entry.sentMessages.size > MAX_CACHED_MESSAGES_PER_SESSION) {
+    const oldestKey = entry.sentMessages.keys().next().value
+    entry.sentMessages.delete(oldestKey)
+  }
+}
+
+// O envio (sendMessage/relayMessage) já retornou — a mensagem foi repassada
+// ao servidor do WhatsApp —, mas isso não confirma entrega. Esperamos até
+// MESSAGE_STATUS_TIMEOUT_MS por uma atualização de status real antes de
+// responder — ver comentário de waitForMessageStatus.
+async function respondWithMessageStatus(res, sock, messageId) {
+  const statusCode = messageId ? await waitForMessageStatus(sock, messageId, MESSAGE_STATUS_TIMEOUT_MS) : null
+
+  if (statusCode === WAMessageStatus.ERROR) {
+    return res.status(502).json({
+      ok: false,
+      id: messageId,
+      status: 'error',
+      error: 'o WhatsApp recusou/falhou ao entregar esta mensagem (confirmado via messages.update)'
+    })
+  }
+
+  res.json({
+    ok: true,
+    id: messageId,
+    // 'unknown' quando o timeout estourou sem confirmação — não é falha,
+    // só significa que a entrega ainda não foi confirmada nesse tempo.
+    status: statusCode === null ? 'unknown' : MESSAGE_STATUS_NAMES[statusCode]
+  })
+}
+
+// Campo "delay" da Evolution: mostra "digitando..." pro destinatário por esse
+// tempo (ms) antes de enviar. Como na Evolution (sendMessageWithTyping), em
+// esperas longas a presença é renovada a cada 20s.
+const TYPING_REFRESH_MS = 20_000
+
+async function simulateTyping(sock, jid, delayMs) {
+  let remaining = delayMs
+  while (remaining > 0) {
+    const chunk = Math.min(remaining, TYPING_REFRESH_MS)
+    await sock.presenceSubscribe(jid)
+    await sock.sendPresenceUpdate('composing', jid)
+    await new Promise((resolve) => setTimeout(resolve, chunk))
+    await sock.sendPresenceUpdate('paused', jid)
+    remaining -= chunk
+  }
 }
 
 // Decodifica uma string base64 (aceita o prefixo opcional de data URL, ex:
@@ -633,11 +729,8 @@ app.post('/sessions/:id/messages', async (req, res) => {
     }
   }
 
-  const entry = sessions.get(id)
-  if (!entry) return res.status(404).json({ error: 'sessão não encontrada ou não ativa neste processo' })
-  if (entry.status !== 'connected') {
-    return res.status(409).json({ error: `sessão não está conectada (status: ${entry.status})` })
-  }
+  const entry = getConnectedEntry(id, res)
+  if (!entry) return
 
   try {
     // Não confiamos no formato de dígitos que o cliente mandou pra montar o
@@ -656,45 +749,119 @@ app.post('/sessions/:id/messages', async (req, res) => {
     }
 
     const result = await entry.sock.sendMessage(resolved.jid, content)
-
-    // Alimenta o cache que o getMessage usa pra atender pedidos de retry do
-    // WhatsApp (ver comentário em startSession). Cache limitado — só serve
-    // pra cobrir um retry logo após o envio, não é histórico permanente.
-    if (result?.key?.id && result.message) {
-      entry.sentMessages.set(result.key.id, result.message)
-      if (entry.sentMessages.size > MAX_CACHED_MESSAGES_PER_SESSION) {
-        const oldestKey = entry.sentMessages.keys().next().value
-        entry.sentMessages.delete(oldestKey)
-      }
-    }
-
-    // sendMessage() já retornou (a mensagem foi repassada ao servidor do
-    // WhatsApp), mas isso não confirma entrega. Esperamos até
-    // MESSAGE_STATUS_TIMEOUT_MS por uma atualização de status real antes de
-    // responder — ver comentário de waitForMessageStatus.
-    const statusCode = result?.key?.id
-      ? await waitForMessageStatus(entry.sock, result.key.id, MESSAGE_STATUS_TIMEOUT_MS)
-      : null
-
-    if (statusCode === WAMessageStatus.ERROR) {
-      return res.status(502).json({
-        ok: false,
-        id: result?.key?.id,
-        status: 'error',
-        error: 'o WhatsApp recusou/falhou ao entregar esta mensagem (confirmado via messages.update)'
-      })
-    }
-
-    res.json({
-      ok: true,
-      id: result?.key?.id,
-      // 'unknown' quando o timeout estourou sem confirmação — não é falha,
-      // só significa que a entrega ainda não foi confirmada nesse tempo.
-      status: statusCode === null ? 'unknown' : MESSAGE_STATUS_NAMES[statusCode]
-    })
+    cacheSentMessage(entry, result?.key?.id, result?.message)
+    await respondWithMessageStatus(res, entry.sock, result?.key?.id)
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
+})
+
+// Fluxo comum de /message/sendList e /message/sendButtons. buildContent(sock)
+// monta o proto (já com o payload validado) e retorna { message } ou
+// { error } (vira 400). bizNode é o nó <biz> que faz o WhatsApp renderizar a
+// mensagem — ver interactive.js.
+async function sendInteractiveMessage(req, res, buildContent, bizNode) {
+  const id = normalizeNumber(req.params.id)
+  const body = req.body ?? {}
+
+  const to = parseRecipientNumber(body.number)
+  if (!to) {
+    return res.status(400).json({
+      error:
+        'informe "number" no corpo: dígitos com DDI (ex: 5511999999999) ou JID de usuário ' +
+        '(ex: 5511999999999@s.whatsapp.net). Grupo e @lid não são suportados.'
+    })
+  }
+  if (body.delay !== undefined && !(Number.isInteger(body.delay) && body.delay >= 0)) {
+    return res.status(400).json({ error: '"delay" precisa ser um inteiro >= 0 (milissegundos)' })
+  }
+
+  const entry = getConnectedEntry(id, res)
+  if (!entry) return
+
+  try {
+    // Mesmo motivo da rota /messages: o JID canônico vem do servidor do
+    // WhatsApp (resolve o "9" ambíguo dos números brasileiros).
+    const [resolved] = (await entry.sock.onWhatsApp(to)) || []
+    if (!resolved?.exists) {
+      return res.status(404).json({ error: `número "${to}" não está registrado no WhatsApp (ou não foi possível confirmar)` })
+    }
+
+    const built = await buildContent(entry.sock)
+    if (built.error) return res.status(400).json({ error: built.error })
+
+    if (body.delay) await simulateTyping(entry.sock, resolved.jid, body.delay)
+
+    // sock.sendMessage() não serve aqui: ele não aceita listMessage /
+    // interactiveMessage e não deixa adicionar o nó <biz>. Geramos a mensagem
+    // completa (id incluso) e mandamos pelo relayMessage, que é o que o
+    // próprio sendMessage usa por baixo, com o <biz> em additionalNodes.
+    const fullMsg = generateWAMessageFromContent(resolved.jid, built.message, { userJid: entry.sock.user.id })
+    await entry.sock.relayMessage(resolved.jid, fullMsg.message, {
+      messageId: fullMsg.key.id,
+      additionalNodes: [bizNode]
+    })
+
+    cacheSentMessage(entry, fullMsg.key.id, fullMsg.message)
+    await respondWithMessageStatus(res, entry.sock, fullMsg.key.id)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+}
+
+// Lista de opções, com o mesmo payload do POST /message/sendList da
+// Evolution API 2.4.0 (number, title, description, footerText, buttonText,
+// sections[].rows[]). "footerText" é o rodapé. Campos da Evolution que não se
+// aplicam a esta bridge (quoted, mentioned, mentionsEveryOne, linkPreview)
+// são aceitos e ignorados — no caminho de listas/botões a própria Evolution
+// também não os aplica à mensagem enviada.
+app.post('/sessions/:id/message/sendList', async (req, res) => {
+  const built = buildListMessage(req.body ?? {})
+  if (built.error) return res.status(400).json({ error: built.error })
+  await sendInteractiveMessage(req, res, async () => built, LIST_BIZ_NODE)
+})
+
+// Botões (reply, url, call, copy, pix), com o mesmo payload do POST
+// /message/sendButtons da Evolution API 2.4.0. "footer" é o rodapé.
+//
+// thumbnailUrl (imagem do cabeçalho), como na Evolution, aceita uma URL
+// http(s) OU a imagem em base64. Atenção: a URL é baixada pelo PRÓPRIO
+// servidor da bridge — diferente da rota /messages, que de propósito só
+// aceita mídia embutida (ver comentário lá). Isso é SSRF por definição:
+// qualquer cliente com a API key consegue fazer a bridge buscar uma URL
+// arbitrária (inclusive endereços internos da rede onde ela roda). Foi uma
+// decisão consciente pra manter compatibilidade com a Evolution.
+app.post('/sessions/:id/message/sendButtons', async (req, res) => {
+  const body = req.body ?? {}
+  const error = validateButtonsPayload(body)
+  if (error) return res.status(400).json({ error })
+
+  await sendInteractiveMessage(
+    req,
+    res,
+    async (sock) => {
+      if (!body.thumbnailUrl) return { message: buildButtonsMessage(body) }
+
+      let image
+      if (/^https?:\/\//i.test(body.thumbnailUrl)) {
+        image = { url: body.thumbnailUrl }
+      } else {
+        image = decodeBase64Media(body.thumbnailUrl)
+        if (!image || image.length === 0) {
+          return { error: '"thumbnailUrl" precisa ser uma URL http(s) ou uma imagem em base64 (puro ou data URL)' }
+        }
+      }
+
+      let media
+      try {
+        media = await prepareWAMessageMedia({ image }, { upload: sock.waUploadToServer, logger })
+      } catch (err) {
+        return { error: `não foi possível obter/enviar a imagem de "thumbnailUrl": ${err.message}` }
+      }
+      return { message: buildButtonsMessage(body, media.imageMessage) }
+    },
+    BUTTONS_BIZ_NODE
+  )
 })
 
 async function main() {

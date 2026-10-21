@@ -118,6 +118,8 @@ Todos abaixo (exceto `/health`) exigem `x-api-key` no header.
 | POST   | `/sessions/:id/disconnect`   | Fecha a conexão mas **mantém** as credenciais — reconecta sem novo QR.     |
 | DELETE | `/sessions/:id`              | Logout definitivo: invalida no WhatsApp e apaga as credenciais do banco.   |
 | POST   | `/sessions/:id/messages`     | Dispara mensagem — texto, imagem ou documento (ver formato abaixo).        |
+| POST   | `/sessions/:id/message/sendList`    | Lista de opções — mesmo payload do `/message/sendList` da Evolution API. |
+| POST   | `/sessions/:id/message/sendButtons` | Botões — mesmo payload do `/message/sendButtons` da Evolution API.     |
 
 ### Enviando texto, imagem ou documento
 
@@ -183,6 +185,100 @@ mesma conta pode estar registrada com ou sem ele), e montar o JID direto dos
 dígitos que o cliente mandou podia resultar num envio "bem sucedido" (`ok:
 true`) que na verdade ia pra um JID que não existe. Se o número não estiver
 registrado no WhatsApp, a resposta é `404`.
+
+### Enviando listas e botões (payload da Evolution API)
+
+`POST /sessions/:id/message/sendList` e `POST /sessions/:id/message/sendButtons`
+aceitam **o mesmo corpo** dos endpoints `/message/sendList/{instance}` e
+`/message/sendButtons/{instance}` da Evolution API 2.4.0, e montam a mensagem
+do mesmo jeito que ela (commit `35a4bd44` da Evolution). O que muda é só a
+URL (a sessão vai no `:id`), o header de auth (`x-api-key`) e a resposta, que
+é a mesma da rota `/messages` (HTTP 200 com `{ ok, id, status }`, ver acima),
+e não o 201 com a mensagem completa que a Evolution devolve.
+
+`number` aceita dígitos com DDI (`5511988887777`) ou o JID de usuário
+(`5511988887777@s.whatsapp.net`). Grupos (`@g.us`) e `@lid` não são
+suportados. `delay` (ms, opcional) mostra "digitando..." antes de enviar.
+`quoted`, `mentioned`, `mentionsEveryOne` e `linkPreview` são aceitos e
+ignorados (no caminho de listas/botões a própria Evolution não os aplica).
+
+**Rodapé:** `footerText` na lista (obrigatório, pode ser `""`) e `footer`
+nos botões (opcional). Os nomes diferentes são os da própria Evolution.
+
+```jsonc
+// lista — POST /sessions/:id/message/sendList
+{
+  "number": "5511988887777",
+  "title": "📊 CONSULTAR DÉBITOS",
+  "description": "💰 *Vencidos:* R$ 116.31",      // opcional
+  "footerText": "Selecione a opção abaixo",         // rodapé
+  "buttonText": "Ver débitos",                      // texto do botão que abre a lista
+  "sections": [
+    {
+      "title": "Débitos Vencidos",
+      "rows": [
+        { "title": "Doc: 22639 | P: 5", "description": "R$ 46.36 - Venc: 19/10/2026", "rowId": "1" }
+      ]
+    }
+  ]
+}
+
+// botões de resposta (até 3) — POST /sessions/:id/message/sendButtons
+{
+  "number": "5511988887777",
+  "title": "Confirma o pedido?",          // vai em negrito no corpo
+  "description": "Pedido 123",            // opcional
+  "footer": "Loja X",                     // rodapé, opcional
+  "thumbnailUrl": "https://...",          // imagem do cabeçalho, opcional (URL ou base64)
+  "buttons": [
+    { "type": "reply", "displayText": "Sim", "id": "sim" },
+    { "type": "reply", "displayText": "Não", "id": "nao" }
+  ]
+}
+
+// botões de ação (até 2, podem ser misturados entre si)
+{ "type": "url",  "displayText": "Abrir site", "url": "https://exemplo.com" }
+{ "type": "call", "displayText": "Ligar",      "phoneNumber": "+5511988887777" }
+{ "type": "copy", "displayText": "Copiar código", "copyCode": "ABC123" }
+
+// PIX (sozinho; sem title/footer/thumbnailUrl)
+{ "number": "5511988887777",
+  "buttons": [{ "type": "pix", "currency": "BRL", "name": "Loja X", "keyType": "cpf", "key": "12345678900" }] }
+// keyType: "phone" | "email" | "cpf" | "cnpj" | "random"
+```
+
+Regras validadas (as da Evolution, mais algumas que ela não confere e que
+deixariam o botão quebrado no aparelho):
+- Lista: `title`, `footerText`, `buttonText` e `sections` obrigatórios; cada
+  seção precisa de `title` e de ao menos uma linha; cada linha precisa de
+  `title` e `rowId`; seções/linhas idênticas repetidas são recusadas.
+- `reply`: até 3, não mistura com outros tipos. `id` é opcional (gerado se
+  omitido).
+- `url`/`call`/`copy`: até 2. Exigem `displayText` e o campo do tipo
+  (`url`, `phoneNumber` ou `copyCode`).
+- `pix`: um só, sozinho; exige `name`, `key` e `keyType`.
+- `title` é obrigatório nos botões, exceto PIX (a Evolution aceita sem e
+  envia o texto `*undefined*`).
+- Os limites do WhatsApp (ex.: ~10 linhas por lista, tamanho máximo de
+  títulos e do `buttonText`) **não** são validados, igual à Evolution.
+
+**Atenção ao `thumbnailUrl` com URL:** a imagem é baixada pelo próprio
+servidor da bridge — ao contrário da rota `/messages`, que só aceita mídia
+embutida. Isso permite SSRF (qualquer cliente com a API key consegue fazer a
+bridge buscar uma URL arbitrária, inclusive da rede interna). Foi mantido pra
+ficar compatível com a Evolution; se a bridge for exposta a clientes não
+confiáveis, prefira mandar a imagem em base64.
+
+**Como funciona e por que é frágil:** o WhatsApp só exibe lista/botão se a
+stanza levar um nó `<biz>`, que o `sock.sendMessage()` do baileys não envia.
+A bridge monta o proto (`listMessage` com `SINGLE_SELECT` /
+`interactiveMessage` + `nativeFlowMessage`) e envia com
+`sock.relayMessage(..., { additionalNodes: [<biz>] })` — ver
+`interactive.js`. Isso é engenharia reversa: se o WhatsApp mudar o formato, a
+mensagem pode voltar a ser descartada sem erro (foi o que aconteceu com a
+Evolution em toda a 2.3.x). O `status` da resposta ajuda a perceber isso. A
+bridge **não** recebe a opção escolhida pelo usuário — não há webhook de
+mensagens recebidas.
 
 ### Exemplo de uso
 

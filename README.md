@@ -25,6 +25,10 @@ A API normaliza automaticamente o que vier com máscara (`(11) 99999-9999` vira
 `11999999999`), mas o ID da sessão precisa bater com 8 a 15 dígitos depois de
 normalizado — senão ela recusa com 400.
 
+Nos endpoints de lista/botões (`/message/sendList` e `/message/sendButtons`),
+o destinatário (`number`) também aceita o JID de usuário, como na Evolution:
+`5511999999999@s.whatsapp.net`. Grupos (`@g.us`) e `@lid` não são suportados.
+
 ## Setup
 
 ### 1. Banco de dados
@@ -118,6 +122,8 @@ Todos abaixo (exceto `/health`) exigem `x-api-key` no header.
 | POST   | `/sessions/:id/disconnect`   | Fecha a conexão mas **mantém** as credenciais — reconecta sem novo QR.     |
 | DELETE | `/sessions/:id`              | Logout definitivo: invalida no WhatsApp e apaga as credenciais do banco.   |
 | POST   | `/sessions/:id/messages`     | Dispara mensagem — texto, imagem ou documento (ver formato abaixo).        |
+| POST   | `/sessions/:id/message/sendList`    | Lista de opções — mesmo payload do `/message/sendList` da Evolution API. |
+| POST   | `/sessions/:id/message/sendButtons` | Botões — mesmo payload do `/message/sendButtons` da Evolution API.     |
 
 ### Enviando texto, imagem ou documento
 
@@ -153,7 +159,9 @@ Mídia só entra **embutida no request** (`mediaBase64`) — de propósito não
 existe um `mediaUrl` que a bridge buscaria sozinha: isso abriria SSRF (fetch
 de URL arbitrária vinda de qualquer cliente que tenha a API key global). Se
 seu caso de uso precisar disso, considere um allowlist de domínios antes de
-implementar.
+implementar. (Exceção consciente: o `thumbnailUrl` do `/message/sendButtons`
+aceita URL, pra manter compatibilidade com a Evolution — ver a seção de
+listas e botões abaixo.)
 
 O limite de tamanho do body JSON é `20mb` por padrão (configurável via
 `JSON_BODY_LIMIT` no `.env`) — o default do Express (100kb) não seria
@@ -184,6 +192,124 @@ dígitos que o cliente mandou podia resultar num envio "bem sucedido" (`ok:
 true`) que na verdade ia pra um JID que não existe. Se o número não estiver
 registrado no WhatsApp, a resposta é `404`.
 
+### Enviando listas e botões (payload da Evolution API)
+
+`POST /sessions/:id/message/sendList` e `POST /sessions/:id/message/sendButtons`
+aceitam **o mesmo corpo** dos endpoints `/message/sendList/{instance}` e
+`/message/sendButtons/{instance}` da Evolution API 2.4.0, e montam a mensagem
+do mesmo jeito que ela (commit `35a4bd44` da Evolution). O que muda é só a
+URL (a sessão vai no `:id`), o header de auth (`x-api-key`) e a resposta, que
+é a mesma da rota `/messages` (HTTP 200 com `{ ok, id, status }`, ver acima),
+e não o 201 com a mensagem completa que a Evolution devolve.
+
+`number` aceita dígitos com DDI (`5511988887777`) ou o JID de usuário
+(`5511988887777@s.whatsapp.net`). Grupos (`@g.us`) e `@lid` não são
+suportados. `delay` (ms, inteiro >= 0, opcional) mostra "digitando..." pro
+destinatário antes de enviar — a resposta HTTP só volta depois desse tempo
+(mais a espera de confirmação de status).
+`quoted`, `mentioned`, `mentionsEveryOne` e `linkPreview` são aceitos e
+ignorados (no caminho de listas/botões a própria Evolution não os aplica).
+
+**Rodapé:** `footerText` na lista (obrigatório, pode ser `""`) e `footer`
+nos botões (opcional). Os nomes diferentes são os da própria Evolution.
+
+**Partes de uma mensagem do `sendButtons`.** Todas são opcionais e podem vir
+juntas:
+
+| Parte | Campo(s) | Observação |
+|---|---|---|
+| Cabeçalho | `headerText` (texto) **ou** `thumbnailUrl` (imagem) | Um tipo só por mensagem; os dois juntos → 400. `headerText` **não existe na Evolution** (extensão desta bridge). |
+| Corpo | `title`, `description` | Formato da Evolution: `*title*` em negrito, `description` abaixo. Qualquer um pode faltar. |
+| Rodapé | `footer` | |
+| Botões | `buttons` | Pode ser omitido (ou `[]`): a mensagem vai só com cabeçalho/corpo/rodapé. |
+
+A mensagem precisa ter ao menos cabeçalho, corpo ou botões. Todas as
+combinações (com e sem botões, com e sem corpo, cabeçalho em texto ou
+imagem) foram testadas num aparelho real e renderizaram.
+
+```jsonc
+// lista — POST /sessions/:id/message/sendList
+{
+  "number": "5511988887777",
+  "title": "📊 CONSULTAR DÉBITOS",
+  "description": "💰 *Vencidos:* R$ 116.31",      // opcional
+  "footerText": "Selecione a opção abaixo",         // rodapé
+  "buttonText": "Ver débitos",                      // texto do botão que abre a lista
+  "sections": [
+    {
+      "title": "Débitos Vencidos",
+      "rows": [
+        { "title": "Doc: 22639 | P: 5", "description": "R$ 46.36 - Venc: 19/10/2026", "rowId": "1" }
+      ]
+    }
+  ]
+}
+
+// botões de resposta (até 3) — POST /sessions/:id/message/sendButtons
+{
+  "number": "5511988887777",
+  "title": "Confirma o pedido?",          // vai em negrito no corpo
+  "description": "Pedido 123",            // opcional
+  "footer": "Loja X",                     // rodapé, opcional
+  "thumbnailUrl": "https://...",          // imagem do cabeçalho, opcional (URL ou base64)
+  "buttons": [
+    { "type": "reply", "displayText": "Sim", "id": "sim" },
+    { "type": "reply", "displayText": "Não", "id": "nao" }
+  ]
+}
+
+// cabeçalho em texto + corpo + rodapé, sem botões
+{
+  "number": "5511988887777",
+  "headerText": "Pedido 123",
+  "description": "Seu pedido saiu para entrega.",
+  "footer": "Loja X"
+}
+
+// botões de ação (até 2, podem ser misturados entre si)
+{ "type": "url",  "displayText": "Abrir site", "url": "https://exemplo.com" }
+{ "type": "call", "displayText": "Ligar",      "phoneNumber": "+5511988887777" }
+{ "type": "copy", "displayText": "Copiar código", "copyCode": "ABC123" }
+
+// PIX (sozinho; recusa headerText/thumbnailUrl/footer; title/description são ignorados)
+{ "number": "5511988887777",
+  "buttons": [{ "type": "pix", "currency": "BRL", "name": "Loja X", "keyType": "cpf", "key": "12345678900" }] }
+// keyType: "phone" | "email" | "cpf" | "cnpj" | "random"
+```
+
+Regras validadas (as da Evolution, mais algumas que ela não confere e que
+deixariam o botão quebrado no aparelho):
+- Lista: `title`, `footerText`, `buttonText` e `sections` obrigatórios; cada
+  seção precisa de `title` e de ao menos uma linha; cada linha precisa de
+  `title` e `rowId`; seções/linhas idênticas repetidas são recusadas.
+- `reply`: até 3, não mistura com outros tipos. `id` é opcional (gerado se
+  omitido).
+- `url`/`call`/`copy`: até 2. Exigem `displayText` e o campo do tipo
+  (`url`, `phoneNumber` ou `copyCode`).
+- `pix`: um só, sozinho; exige `name`, `key` e `keyType`. Não aceita
+  `headerText`, `thumbnailUrl` nem `footer` (a mensagem de PIX vai sem
+  cabeçalho/corpo/rodapé, como na Evolution).
+- Os limites do WhatsApp (ex.: ~10 linhas por lista, tamanho máximo de
+  títulos e do `buttonText`) **não** são validados, igual à Evolution.
+
+**Atenção ao `thumbnailUrl` com URL:** a imagem é baixada pelo próprio
+servidor da bridge — ao contrário da rota `/messages`, que só aceita mídia
+embutida. Isso permite SSRF (qualquer cliente com a API key consegue fazer a
+bridge buscar uma URL arbitrária, inclusive da rede interna). Foi mantido pra
+ficar compatível com a Evolution; se a bridge for exposta a clientes não
+confiáveis, prefira mandar a imagem em base64.
+
+**Como funciona e por que é frágil:** o WhatsApp só exibe lista/botão se a
+stanza levar um nó `<biz>`, que o `sock.sendMessage()` do baileys não envia.
+A bridge monta o proto (`listMessage` com `SINGLE_SELECT` /
+`interactiveMessage` + `nativeFlowMessage`) e envia com
+`sock.relayMessage(..., { additionalNodes: [<biz>] })` — ver
+`interactive.js`. Isso é engenharia reversa: se o WhatsApp mudar o formato, a
+mensagem pode voltar a ser descartada sem erro (foi o que aconteceu com a
+Evolution em toda a 2.3.x). O `status` da resposta ajuda a perceber isso. A
+bridge **não** recebe a opção escolhida pelo usuário — não há webhook de
+mensagens recebidas.
+
 ### Exemplo de uso
 
 ```bash
@@ -204,6 +330,16 @@ curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/m
 curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/messages \
   -H "Content-Type: application/json" \
   -d '{"to": "5511988887777", "type": "image", "mediaBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "mimetype": "image/png", "caption": "teste"}'
+
+# 3c. dispara lista de opções (ver "Enviando listas e botões" acima)
+curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/message/sendList \
+  -H "Content-Type: application/json" \
+  -d '{"number": "5511988887777", "title": "Menu", "footerText": "Escolha uma opção", "buttonText": "Ver opções", "sections": [{"title": "Opções", "rows": [{"title": "Falar com atendente", "rowId": "atendente"}]}]}'
+
+# 3d. dispara botões com cabeçalho em texto, corpo e rodapé
+curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/message/sendButtons \
+  -H "Content-Type: application/json" \
+  -d '{"number": "5511988887777", "headerText": "Pedido 123", "title": "Confirma?", "footer": "Loja X", "buttons": [{"type": "reply", "displayText": "Sim", "id": "sim"}]}'
 
 # 4. desconecta sem perder a sessão (dá pra reconectar depois sem novo QR,
 #    e NÃO aciona reconexão automática — foi um pedido manual)
@@ -486,11 +622,38 @@ versão pra versão) que:
   Corrigido: `.env`, `.env.*` (com exceção do `.env.example`) adicionados ao
   `.gitignore`, espelhando o que o `.dockerignore` já fazia.
 
+### Teste real — rodada 3 (listas, botões e cabeçalhos)
+
+Rodado contra os servidores reais do WhatsApp, com um número real pareado
+via QR code e confirmação visual no aparelho de destino:
+
+- Pareamento via QR, `restartRequired` pós-QR e restauração da sessão a
+  partir do Postgres depois de reiniciar o processo (sem novo QR).
+- `/messages`: texto, imagem e documento — todos `server_ack` e recebidos.
+- `/message/sendList`: lista com 5 seções e 9 linhas, rodapé e
+  `number` no formato `...@s.whatsapp.net` — recebida e renderizada.
+- `/message/sendButtons`: reply (3 botões + `delay`), url + copy, PIX,
+  cabeçalho com imagem (URL e base64), cabeçalho em texto, com e sem corpo,
+  com e sem botões, e só corpo — todos recebidos e renderizados.
+
+Achados desta rodada:
+
+- **Atrás de proxy HTTP(S) a bridge não conecta.** O `ws` usado pelo baileys
+  abre o TLS direto e ignora `HTTPS_PROXY`/`NODE_USE_ENV_PROXY`; neste
+  ambiente o teste só funcionou injetando um agente de proxy num script de
+  pré-carga (fora do projeto). Se a produção sair pra internet por proxy,
+  isso precisa virar uma opção (`agent` do `makeWASocket`).
+- **O libsignal (dependência do baileys) escreve chaves de sessão no
+  console** ao fechar/renegociar uma sessão Signal (`Closing session:
+  SessionEntry { ... privKey: <Buffer ...> }`). Não vem do nosso código, mas
+  vale não reter esse stdout em produção (ou filtrá-lo).
+
 ### Ainda não verificado (limitação deste ambiente, não deste código)
 
-- Pareamento real via QR code contra os servidores do WhatsApp.
-- Envio de mensagem real e um cenário real de retry (pra validar o
-  `getMessage` customizado e o cache interno do baileys 7 na prática, não
-  só lendo o código-fonte).
+- Um cenário real de retry (pra validar o `getMessage` customizado e o
+  cache interno do baileys 7 na prática, não só lendo o código-fonte).
+- Renderização de listas/botões em cada cliente separadamente (Android, iOS,
+  WhatsApp Web/Desktop) — o teste real confirmou o recebimento no aparelho de
+  destino, sem uma matriz por plataforma.
 - `docker compose up --build` de ponta a ponta (bloqueado pela política de
   rede deste ambiente pro registry do Docker Hub, não pelo projeto).

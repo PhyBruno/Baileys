@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "WhatsApp Bridge API (Baileys + Postgres)",
-    "description": "Collection de exemplo para a bridge Baileys clonada em C:\\repos\\Baileys. Fluxo: connect -> qr -> messages / sendList / sendButtons -> disconnect -> connect -> delete. Ajuste as variaveis apiKey/sessionId/toNumber conforme seu ambiente.",
+    "description": "Collection de exemplo para a bridge Baileys clonada em C:\\repos\\Baileys. Fluxo: connect -> qr -> messages (texto/imagem/documento) / message/sendList / message/sendButtons (payload da Evolution API; cabecalho texto ou imagem, corpo, rodape e botoes opcionais) -> disconnect -> connect -> delete. Ajuste as variaveis apiKey/sessionId/toNumber conforme seu ambiente.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -240,6 +240,26 @@
         "body": {
           "mode": "raw",
           "raw": "{\n  \"number\": \"{{toNumber}}\",\n  \"headerText\": \"Pedido 123\",\n  \"description\": \"Seu pedido saiu para entrega.\",\n  \"footer\": \"Loja X\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/message/sendButtons",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "message", "sendButtons"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Send image header (thumbnailUrl) + body + footer + button",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"number\": \"{{toNumber}}\",\n  \"thumbnailUrl\": \"https://avatars.githubusercontent.com/u/9919?s=200\",\n  \"title\": \"Novidade na loja\",\n  \"description\": \"Confira o produto da semana.\",\n  \"footer\": \"Loja X\",\n  \"buttons\": [\n    {\n      \"type\": \"url\",\n      \"displayText\": \"Ver produto\",\n      \"url\": \"https://exemplo.com\"\n    }\n  ]\n}"
         },
         "url": {
           "raw": "{{baseUrl}}/sessions/{{sessionId}}/message/sendButtons",

@@ -25,6 +25,10 @@ A API normaliza automaticamente o que vier com máscara (`(11) 99999-9999` vira
 `11999999999`), mas o ID da sessão precisa bater com 8 a 15 dígitos depois de
 normalizado — senão ela recusa com 400.
 
+Nos endpoints de lista/botões (`/message/sendList` e `/message/sendButtons`),
+o destinatário (`number`) também aceita o JID de usuário, como na Evolution:
+`5511999999999@s.whatsapp.net`. Grupos (`@g.us`) e `@lid` não são suportados.
+
 ## Setup
 
 ### 1. Banco de dados
@@ -155,7 +159,9 @@ Mídia só entra **embutida no request** (`mediaBase64`) — de propósito não
 existe um `mediaUrl` que a bridge buscaria sozinha: isso abriria SSRF (fetch
 de URL arbitrária vinda de qualquer cliente que tenha a API key global). Se
 seu caso de uso precisar disso, considere um allowlist de domínios antes de
-implementar.
+implementar. (Exceção consciente: o `thumbnailUrl` do `/message/sendButtons`
+aceita URL, pra manter compatibilidade com a Evolution — ver a seção de
+listas e botões abaixo.)
 
 O limite de tamanho do body JSON é `20mb` por padrão (configurável via
 `JSON_BODY_LIMIT` no `.env`) — o default do Express (100kb) não seria
@@ -198,7 +204,9 @@ e não o 201 com a mensagem completa que a Evolution devolve.
 
 `number` aceita dígitos com DDI (`5511988887777`) ou o JID de usuário
 (`5511988887777@s.whatsapp.net`). Grupos (`@g.us`) e `@lid` não são
-suportados. `delay` (ms, opcional) mostra "digitando..." antes de enviar.
+suportados. `delay` (ms, inteiro >= 0, opcional) mostra "digitando..." pro
+destinatário antes de enviar — a resposta HTTP só volta depois desse tempo
+(mais a espera de confirmação de status).
 `quoted`, `mentioned`, `mentionsEveryOne` e `linkPreview` são aceitos e
 ignorados (no caminho de listas/botões a própria Evolution não os aplica).
 
@@ -263,7 +271,7 @@ imagem) foram testadas num aparelho real e renderizaram.
 { "type": "call", "displayText": "Ligar",      "phoneNumber": "+5511988887777" }
 { "type": "copy", "displayText": "Copiar código", "copyCode": "ABC123" }
 
-// PIX (sozinho; sem title/footer/thumbnailUrl)
+// PIX (sozinho; recusa headerText/thumbnailUrl/footer; title/description são ignorados)
 { "number": "5511988887777",
   "buttons": [{ "type": "pix", "currency": "BRL", "name": "Loja X", "keyType": "cpf", "key": "12345678900" }] }
 // keyType: "phone" | "email" | "cpf" | "cnpj" | "random"
@@ -322,6 +330,16 @@ curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/m
 curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/messages \
   -H "Content-Type: application/json" \
   -d '{"to": "5511988887777", "type": "image", "mediaBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "mimetype": "image/png", "caption": "teste"}'
+
+# 3c. dispara lista de opções (ver "Enviando listas e botões" acima)
+curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/message/sendList \
+  -H "Content-Type: application/json" \
+  -d '{"number": "5511988887777", "title": "Menu", "footerText": "Escolha uma opção", "buttonText": "Ver opções", "sections": [{"title": "Opções", "rows": [{"title": "Falar com atendente", "rowId": "atendente"}]}]}'
+
+# 3d. dispara botões com cabeçalho em texto, corpo e rodapé
+curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/message/sendButtons \
+  -H "Content-Type: application/json" \
+  -d '{"number": "5511988887777", "headerText": "Pedido 123", "title": "Confirma?", "footer": "Loja X", "buttons": [{"type": "reply", "displayText": "Sim", "id": "sim"}]}'
 
 # 4. desconecta sem perder a sessão (dá pra reconectar depois sem novo QR,
 #    e NÃO aciona reconexão automática — foi um pedido manual)
@@ -604,11 +622,38 @@ versão pra versão) que:
   Corrigido: `.env`, `.env.*` (com exceção do `.env.example`) adicionados ao
   `.gitignore`, espelhando o que o `.dockerignore` já fazia.
 
+### Teste real — rodada 3 (listas, botões e cabeçalhos)
+
+Rodado contra os servidores reais do WhatsApp, com um número real pareado
+via QR code e confirmação visual no aparelho de destino:
+
+- Pareamento via QR, `restartRequired` pós-QR e restauração da sessão a
+  partir do Postgres depois de reiniciar o processo (sem novo QR).
+- `/messages`: texto, imagem e documento — todos `server_ack` e recebidos.
+- `/message/sendList`: lista com 5 seções e 9 linhas, rodapé e
+  `number` no formato `...@s.whatsapp.net` — recebida e renderizada.
+- `/message/sendButtons`: reply (3 botões + `delay`), url + copy, PIX,
+  cabeçalho com imagem (URL e base64), cabeçalho em texto, com e sem corpo,
+  com e sem botões, e só corpo — todos recebidos e renderizados.
+
+Achados desta rodada:
+
+- **Atrás de proxy HTTP(S) a bridge não conecta.** O `ws` usado pelo baileys
+  abre o TLS direto e ignora `HTTPS_PROXY`/`NODE_USE_ENV_PROXY`; neste
+  ambiente o teste só funcionou injetando um agente de proxy num script de
+  pré-carga (fora do projeto). Se a produção sair pra internet por proxy,
+  isso precisa virar uma opção (`agent` do `makeWASocket`).
+- **O libsignal (dependência do baileys) escreve chaves de sessão no
+  console** ao fechar/renegociar uma sessão Signal (`Closing session:
+  SessionEntry { ... privKey: <Buffer ...> }`). Não vem do nosso código, mas
+  vale não reter esse stdout em produção (ou filtrá-lo).
+
 ### Ainda não verificado (limitação deste ambiente, não deste código)
 
-- Pareamento real via QR code contra os servidores do WhatsApp.
-- Envio de mensagem real e um cenário real de retry (pra validar o
-  `getMessage` customizado e o cache interno do baileys 7 na prática, não
-  só lendo o código-fonte).
+- Um cenário real de retry (pra validar o `getMessage` customizado e o
+  cache interno do baileys 7 na prática, não só lendo o código-fonte).
+- Renderização de listas/botões em cada cliente separadamente (Android, iOS,
+  WhatsApp Web/Desktop) — o teste real confirmou o recebimento no aparelho de
+  destino, sem uma matriz por plataforma.
 - `docker compose up --build` de ponta a ponta (bloqueado pela política de
   rede deste ambiente pro registry do Docker Hub, não pelo projeto).

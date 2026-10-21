@@ -822,7 +822,9 @@ app.post('/sessions/:id/message/sendList', async (req, res) => {
 })
 
 // Botões (reply, url, call, copy, pix), com o mesmo payload do POST
-// /message/sendButtons da Evolution API 2.4.0. "footer" é o rodapé.
+// /message/sendButtons da Evolution API 2.4.0. "footer" é o rodapé. Além da
+// Evolution, aceita "headerText" (cabeçalho em texto) e deixa cabeçalho,
+// corpo, rodapé e botões opcionais — ver validateButtonsPayload.
 //
 // thumbnailUrl (imagem do cabeçalho), como na Evolution, aceita uma URL
 // http(s) OU a imagem em base64. Atenção: a URL é baixada pelo PRÓPRIO

@@ -210,6 +210,46 @@
       "response": []
     },
     {
+      "name": "Send text header + body + footer + buttons",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"number\": \"{{toNumber}}\",\n  \"headerText\": \"Pedido 123\",\n  \"title\": \"Confirma o pedido?\",\n  \"description\": \"Total: R$ 46,36\",\n  \"footer\": \"Loja X\",\n  \"buttons\": [\n    {\n      \"type\": \"reply\",\n      \"displayText\": \"Sim\",\n      \"id\": \"sim\"\n    },\n    {\n      \"type\": \"reply\",\n      \"displayText\": \"Não\",\n      \"id\": \"nao\"\n    }\n  ]\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/message/sendButtons",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "message", "sendButtons"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Send text header + body + footer (no buttons)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"number\": \"{{toNumber}}\",\n  \"headerText\": \"Pedido 123\",\n  \"description\": \"Seu pedido saiu para entrega.\",\n  \"footer\": \"Loja X\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/message/sendButtons",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "message", "sendButtons"]
+        }
+      },
+      "response": []
+    },
+    {
       "name": "Disconnect session",
       "request": {
         "method": "POST",

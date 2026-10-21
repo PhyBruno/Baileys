@@ -184,13 +184,29 @@ function toButtonParamsJson(button) {
 // buttonMessage() da Evolution). Não monta o proto ainda porque a imagem do
 // cabeçalho (thumbnailUrl) precisa ser enviada antes pro servidor de mídia do
 // WhatsApp — ver buildButtonsMessage. Retorna a mensagem de erro ou null.
+//
+// Além do payload da Evolution, aceita "headerText" (cabeçalho em texto, que
+// a Evolution não tem) e deixa todas as partes opcionais: cabeçalho (texto
+// OU imagem), corpo (title/description), rodapé e botões — testado num
+// aparelho real, todas as combinações renderizam, inclusive sem botões e sem
+// corpo.
 export function validateButtonsPayload(body) {
-  const optionalError = checkOptionalStrings(body, ['title', 'description', 'footer', 'thumbnailUrl'])
+  const optionalError = checkOptionalStrings(body, ['title', 'description', 'footer', 'thumbnailUrl', 'headerText'])
   if (optionalError) return optionalError
 
-  const { buttons } = body
-  if (!Array.isArray(buttons) || buttons.length === 0) {
-    return 'informe "buttons" no corpo (lista com ao menos um botão)'
+  // O cabeçalho de uma mensagem interativa é de um tipo só.
+  if (body.headerText && body.thumbnailUrl) {
+    return 'use "headerText" (cabeçalho em texto) OU "thumbnailUrl" (cabeçalho com imagem), não os dois'
+  }
+
+  const buttons = body.buttons ?? []
+  if (!Array.isArray(buttons)) return '"buttons" precisa ser uma lista'
+
+  if (buttons.length === 0) {
+    if (!body.headerText && !body.thumbnailUrl && !body.title && !body.description) {
+      return 'a mensagem precisa ter ao menos cabeçalho ("headerText" ou "thumbnailUrl"), corpo ("title"/"description") ou "buttons"'
+    }
+    return null
   }
 
   for (const [i, button] of buttons.entries()) {
@@ -241,43 +257,56 @@ export function validateButtonsPayload(body) {
     if (buttons.length > 1) return 'só é permitido um botão "pix", e sozinho'
     // A mensagem de PIX vai só com o nativeFlowMessage (sem body/footer/header),
     // igual à Evolution — recusamos em vez de ignorar esses campos em silêncio.
-    for (const field of ['footer', 'thumbnailUrl']) {
+    for (const field of ['footer', 'thumbnailUrl', 'headerText']) {
       if (body[field]) return `"${field}" não é suportado junto com botão "pix"`
     }
     return null
   }
   if (hasCta && buttons.length > 2) return 'máximo de 2 botões de CTA ("url", "call", "copy")'
 
-  // A Evolution aceita sem title e manda o texto "*undefined*" pro cliente.
-  if (!isNonEmptyString(body.title)) return 'informe "title" no corpo (texto não vazio)'
-
   return null
 }
 
+// Corpo no formato da Evolution: "title" em negrito e "description" abaixo.
+// Qualquer um dos dois pode faltar; sem nenhum, a mensagem vai sem corpo.
+function buildBodyText({ title, description }) {
+  const parts = [title ? `*${title}*` : '', description || ''].filter(Boolean)
+  return parts.length ? parts.join('\n\n') : null
+}
+
 // Monta o proto dos botões a partir de um payload JÁ validado por
-// validateButtonsPayload. imageMessage é o cabeçalho opcional, já enviado pro
-// servidor de mídia (resultado de prepareWAMessageMedia).
+// validateButtonsPayload. imageMessage é o cabeçalho com imagem opcional, já
+// enviado pro servidor de mídia (resultado de prepareWAMessageMedia).
 export function buildButtonsMessage(body, imageMessage) {
+  const buttons = body.buttons ?? []
   const nativeFlowMessage = {
-    buttons: body.buttons.map((button) => ({
+    // Sem botões vai a lista vazia — mesma estrutura do caso com botões, e
+    // renderiza normalmente (cabeçalho/corpo/rodapé) num aparelho real.
+    buttons: buttons.map((button) => ({
       name: NATIVE_FLOW_NAMES[button.type],
       buttonParamsJson: toButtonParamsJson(button)
     })),
     messageParamsJson: JSON.stringify({ from: 'api', templateId: crypto.randomUUID() })
   }
 
-  if (body.buttons[0].type === 'pix') {
+  if (buttons[0]?.type === 'pix') {
     return { interactiveMessage: { nativeFlowMessage } }
   }
 
+  let header
+  if (imageMessage) header = { hasMediaAttachment: true, imageMessage }
+  else if (body.headerText) header = { title: body.headerText, hasMediaAttachment: false }
+
+  const bodyText = buildBodyText(body)
+
   // Sem o wrapper viewOnceMessage que a Evolution usava no 2.3.x: segundo o
   // commit 35a4bd44 ele impede a renderização no WhatsApp Web/Desktop.
-  // "footer" é o rodapé; omitido quando vazio.
+  // Cada parte é omitida quando vazia; "footer" é o rodapé.
   return {
     interactiveMessage: {
-      body: { text: `*${body.title}*` + (body.description ? `\n\n${body.description}` : '') },
+      header,
+      body: bodyText ? { text: bodyText } : undefined,
       footer: body.footer ? { text: body.footer } : undefined,
-      header: imageMessage ? { hasMediaAttachment: true, imageMessage } : undefined,
       nativeFlowMessage
     }
   }

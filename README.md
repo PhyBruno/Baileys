@@ -205,6 +205,20 @@ ignorados (no caminho de listas/botões a própria Evolution não os aplica).
 **Rodapé:** `footerText` na lista (obrigatório, pode ser `""`) e `footer`
 nos botões (opcional). Os nomes diferentes são os da própria Evolution.
 
+**Partes de uma mensagem do `sendButtons`.** Todas são opcionais e podem vir
+juntas:
+
+| Parte | Campo(s) | Observação |
+|---|---|---|
+| Cabeçalho | `headerText` (texto) **ou** `thumbnailUrl` (imagem) | Um tipo só por mensagem; os dois juntos → 400. `headerText` **não existe na Evolution** (extensão desta bridge). |
+| Corpo | `title`, `description` | Formato da Evolution: `*title*` em negrito, `description` abaixo. Qualquer um pode faltar. |
+| Rodapé | `footer` | |
+| Botões | `buttons` | Pode ser omitido (ou `[]`): a mensagem vai só com cabeçalho/corpo/rodapé. |
+
+A mensagem precisa ter ao menos cabeçalho, corpo ou botões. Todas as
+combinações (com e sem botões, com e sem corpo, cabeçalho em texto ou
+imagem) foram testadas num aparelho real e renderizaram.
+
 ```jsonc
 // lista — POST /sessions/:id/message/sendList
 {
@@ -236,6 +250,14 @@ nos botões (opcional). Os nomes diferentes são os da própria Evolution.
   ]
 }
 
+// cabeçalho em texto + corpo + rodapé, sem botões
+{
+  "number": "5511988887777",
+  "headerText": "Pedido 123",
+  "description": "Seu pedido saiu para entrega.",
+  "footer": "Loja X"
+}
+
 // botões de ação (até 2, podem ser misturados entre si)
 { "type": "url",  "displayText": "Abrir site", "url": "https://exemplo.com" }
 { "type": "call", "displayText": "Ligar",      "phoneNumber": "+5511988887777" }
@@ -256,9 +278,9 @@ deixariam o botão quebrado no aparelho):
   omitido).
 - `url`/`call`/`copy`: até 2. Exigem `displayText` e o campo do tipo
   (`url`, `phoneNumber` ou `copyCode`).
-- `pix`: um só, sozinho; exige `name`, `key` e `keyType`.
-- `title` é obrigatório nos botões, exceto PIX (a Evolution aceita sem e
-  envia o texto `*undefined*`).
+- `pix`: um só, sozinho; exige `name`, `key` e `keyType`. Não aceita
+  `headerText`, `thumbnailUrl` nem `footer` (a mensagem de PIX vai sem
+  cabeçalho/corpo/rodapé, como na Evolution).
 - Os limites do WhatsApp (ex.: ~10 linhas por lista, tamanho máximo de
   títulos e do `buttonText`) **não** são validados, igual à Evolution.
 

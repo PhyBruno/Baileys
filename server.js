@@ -254,7 +254,7 @@ async function simulateTyping(sock, jid, delayMs) {
 
 // Decodifica uma string base64 (aceita o prefixo opcional de data URL, ex:
 // "data:image/png;base64,...") pro Buffer que o baileys espera em
-// image/document. Retorna null se a string não for base64 válido ou vier
+// image/video/document. Retorna null se a string não for base64 válido ou vier
 // vazia — o chamador decide como responder (400), em vez desta função
 // lançar exceção pra um caso de erro totalmente esperado (input do cliente).
 function decodeBase64Media(raw) {
@@ -679,9 +679,9 @@ app.delete('/sessions/:id', async (req, res) => {
   res.json({ id, status: 'removed' })
 })
 
-// Endpoint principal: dispara mensagem (texto, imagem ou documento) por uma
-// sessão específica. "type" default é "text", pra manter compatibilidade
-// total com o formato antigo { to, message }. Imagem/documento vão em
+// Endpoint principal: dispara mensagem (texto, imagem, vídeo ou documento) por
+// uma sessão específica. "type" default é "text", pra manter compatibilidade
+// total com o formato antigo { to, message }. Imagem/vídeo/documento vão em
 // "mediaBase64" — de propósito NÃO existe um "mediaUrl" que o servidor
 // buscaria sozinho: isso seria SSRF (fetch de URL arbitrária vinda de
 // qualquer cliente que tenha a API key global), então mídia só entra
@@ -698,8 +698,8 @@ app.post('/sessions/:id/messages', async (req, res) => {
       error: 'formato de "to" inválido. Use apenas dígitos com DDI, ex: 5511999999999'
     })
   }
-  if (!['text', 'image', 'document'].includes(type)) {
-    return res.status(400).json({ error: 'campo "type" inválido. Use "text" (default), "image" ou "document".' })
+  if (!['text', 'image', 'video', 'document'].includes(type)) {
+    return res.status(400).json({ error: 'campo "type" inválido. Use "text" (default), "image", "video" ou "document".' })
   }
 
   let content
@@ -724,6 +724,13 @@ app.post('/sessions/:id/messages', async (req, res) => {
         return res.status(400).json({ error: 'informe "mimetype" no corpo (obrigatório quando "type" é "document")' })
       }
       content = { document: buffer, mimetype, fileName: fileName || 'arquivo', caption: caption || undefined }
+    } else if (type === 'video') {
+      // Também obrigatório aqui: sem mimetype o WhatsApp não sabe tocar o
+      // vídeo no aparelho (o baileys não detecta sozinho como na imagem).
+      if (!mimetype) {
+        return res.status(400).json({ error: 'informe "mimetype" no corpo (obrigatório quando "type" é "video")' })
+      }
+      content = { video: buffer, mimetype, caption: caption || undefined }
     } else {
       content = { image: buffer, caption: caption || undefined, ...(mimetype ? { mimetype } : {}) }
     }

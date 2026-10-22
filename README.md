@@ -121,13 +121,13 @@ Todos abaixo (exceto `/health`) exigem `x-api-key` no header.
 | GET    | `/sessions`                  | Lista todas as sessões (persistidas no banco) e seus status.               |
 | POST   | `/sessions/:id/disconnect`   | Fecha a conexão mas **mantém** as credenciais — reconecta sem novo QR.     |
 | DELETE | `/sessions/:id`              | Logout definitivo: invalida no WhatsApp e apaga as credenciais do banco.   |
-| POST   | `/sessions/:id/messages`     | Dispara mensagem — texto, imagem ou documento (ver formato abaixo).        |
+| POST   | `/sessions/:id/messages`     | Dispara mensagem — texto, imagem, vídeo ou documento (ver formato abaixo). |
 | POST   | `/sessions/:id/message/sendList`    | Lista de opções — mesmo payload do `/message/sendList` da Evolution API. |
 | POST   | `/sessions/:id/message/sendButtons` | Botões — mesmo payload do `/message/sendButtons` da Evolution API.     |
 
-### Enviando texto, imagem ou documento
+### Enviando texto, imagem, vídeo ou documento
 
-`POST /sessions/:id/messages` aceita três formatos de corpo, selecionados pelo
+`POST /sessions/:id/messages` aceita quatro formatos de corpo, selecionados pelo
 campo `"type"` (default `"text"`, mantém compatibilidade total com o formato
 antigo):
 
@@ -141,6 +141,15 @@ antigo):
   "type": "image",
   "mediaBase64": "<conteúdo em base64, com ou sem prefixo data:image/...;base64,>",
   "mimetype": "image/png",   // opcional — o baileys detecta sozinho se omitido
+  "caption": "legenda opcional"
+}
+
+// vídeo
+{
+  "to": "5511988887777",
+  "type": "video",
+  "mediaBase64": "<conteúdo em base64, com ou sem prefixo data:video/...;base64,>",
+  "mimetype": "video/mp4",   // obrigatório em vídeos
   "caption": "legenda opcional"
 }
 
@@ -165,7 +174,7 @@ listas e botões abaixo.)
 
 O limite de tamanho do body JSON é `20mb` por padrão (configurável via
 `JSON_BODY_LIMIT` no `.env`) — o default do Express (100kb) não seria
-suficiente pra imagem/documento em base64.
+suficiente pra imagem/vídeo/documento em base64.
 
 **A resposta confirma o status real da entrega, não só que a bridge aceitou o
 envio.** `sock.sendMessage()` do baileys resolve assim que a mensagem é
@@ -326,7 +335,7 @@ curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/m
   -H "Content-Type: application/json" \
   -d '{"to": "5511988887777", "message": "Olá!"}'
 
-# 3b. dispara imagem (ver "Enviando texto, imagem ou documento" acima pro formato de documento)
+# 3b. dispara imagem (ver "Enviando texto, imagem, vídeo ou documento" acima pros formatos de vídeo e documento)
 curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/messages \
   -H "Content-Type: application/json" \
   -d '{"to": "5511988887777", "type": "image", "mediaBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "mimetype": "image/png", "caption": "teste"}'

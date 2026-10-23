@@ -146,3 +146,61 @@ export async function normalizeKeyAddressing(key, { resolvePn, ownJids = [] } = 
 
   return out
 }
+
+// Consultas LID → PN simultâneas por mensagem, nas menções.
+const MENTION_LOOKUP_BATCH = 20
+
+/**
+ * Mesma troca LID → PN para quem foi citado (contextInfo.participant) e
+ * mencionado (contextInfo.mentionedJid[]). Em grupo os dois chegam só como
+ * LID, e o consumidor identifica as pessoas pelo telefone. Campos extras do
+ * WSB, que a Evolution não tem:
+ * - participantAlt: o LID trocado (mesma convenção de key.participantAlt);
+ * - mentionedJidAlt[]: paralelo a mentionedJid, com o LID nas posições
+ *   trocadas e null nas demais. Só existe se alguma posição foi trocada.
+ *
+ * participant igual ao próprio número fica como está (citação de mensagem
+ * nossa). Sem PN conhecido, o endereço fica como veio. Nunca lança e não
+ * altera o objeto recebido. Retorna null se contextInfo for null.
+ */
+export async function normalizeContextInfoAddressing(contextInfo, { resolvePn, ownJids = [] } = {}) {
+  if (!contextInfo || typeof contextInfo !== 'object') return contextInfo ?? null
+  try {
+    const out = { ...contextInfo }
+    const isOwn = (jid) => ownJids.some((own) => own && areJidsSameUser(jid, own))
+
+    const participant = typeof contextInfo.participant === 'string' ? normalizeUser(contextInfo.participant) : undefined
+    if (participant && isLidJid(participant) && !isOwn(participant)) {
+      const pn = await pnFor(participant, undefined, resolvePn)
+      if (pn) {
+        out.participant = pn
+        out.participantAlt = participant
+      }
+    }
+
+    if (Array.isArray(contextInfo.mentionedJid) && contextInfo.mentionedJid.length > 0) {
+      const lids = contextInfo.mentionedJid.map((jid) => {
+        const lid = typeof jid === 'string' ? normalizeUser(jid) : undefined
+        return lid && isLidJid(lid) ? lid : null
+      })
+      // Cada LID distinto uma vez, em lotes paralelos: uma menção a muitas
+      // pessoas (ex.: todos de um grupo grande) não soma a espera de cada
+      // lookup nem dispara centenas de consultas ao mesmo tempo.
+      const unique = [...new Set(lids.filter(Boolean))]
+      const pns = new Map()
+      for (let i = 0; i < unique.length; i += MENTION_LOOKUP_BATCH) {
+        const batch = unique.slice(i, i + MENTION_LOOKUP_BATCH)
+        const found = await Promise.all(batch.map((lid) => pnFor(lid, undefined, resolvePn)))
+        batch.forEach((lid, j) => found[j] && pns.set(lid, found[j]))
+      }
+      if (pns.size > 0) {
+        out.mentionedJid = contextInfo.mentionedJid.map((jid, i) => pns.get(lids[i]) ?? jid)
+        out.mentionedJidAlt = lids.map((lid) => (pns.has(lid) ? lid : null))
+      }
+    }
+
+    return out
+  } catch {
+    return contextInfo
+  }
+}

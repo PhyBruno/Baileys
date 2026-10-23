@@ -328,7 +328,7 @@
     },
     {
       "name": "Mensagens",
-      "description": "Histórico das mensagens gravadas (formato data do messages.upsert da Evolution + origin) e mídia sob demanda.",
+      "description": "Histórico das mensagens gravadas (formato data do messages.upsert da Evolution + origin) e mídia sob demanda. Itens de grupo trazem também groupSubject (nome atual do grupo, ou null); itens individuais não têm o campo.",
       "item": [
         {
           "name": "List messages",

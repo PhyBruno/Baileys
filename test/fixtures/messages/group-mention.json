@@ -1,0 +1,20 @@
+{
+  "key": {
+    "remoteJid": "120363000000000000@g.us",
+    "participant": "123456789012345@lid",
+    "participantAlt": "5511988887777@s.whatsapp.net",
+    "addressingMode": "lid",
+    "fromMe": false,
+    "id": "A025B2C3D4E5F60718293A4B5C6D7E8F"
+  },
+  "messageTimestamp": 1792750000,
+  "pushName": "Maria Exemplo",
+  "message": {
+    "extendedTextMessage": {
+      "text": "@5511977776666 e @555555555555555, olhem isto",
+      "contextInfo": {
+        "mentionedJid": ["5511977776666@s.whatsapp.net", "555555555555555@lid"]
+      }
+    }
+  }
+}

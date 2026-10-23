@@ -70,6 +70,12 @@ services:
       - WEBHOOK_HEADERS_KEY=${WEBHOOK_HEADERS_KEY:-}
       ## Histórico de mensagens: apaga as com mais de N dias (0 = guarda pra sempre)
       - MESSAGE_RETENTION_DAYS=${MESSAGE_RETENTION_DAYS:-0}
+      ## Nome dos grupos (groupSubject): cache em memória, consulta ao WhatsApp e limites do histórico
+      - GROUP_METADATA_TTL_MS=${GROUP_METADATA_TTL_MS:-21600000}
+      - GROUP_METADATA_FAILURE_TTL_MS=${GROUP_METADATA_FAILURE_TTL_MS:-300000}
+      - GROUP_METADATA_TIMEOUT_MS=${GROUP_METADATA_TIMEOUT_MS:-3000}
+      - GROUP_METADATA_HISTORY_MAX_LOOKUPS=${GROUP_METADATA_HISTORY_MAX_LOOKUPS:-10}
+      - GROUP_METADATA_HISTORY_BUDGET_MS=${GROUP_METADATA_HISTORY_BUDGET_MS:-5000}
     deploy:
       mode: replicated
       replicas: 1

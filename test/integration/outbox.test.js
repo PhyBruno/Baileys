@@ -1,6 +1,7 @@
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { lockDatabase } from './dbLock.js'
 
 // Teste de integração do outbox (T019): precisa de um Postgres de teste.
 //   TEST_DATABASE_URL=postgres://user:senha@localhost:5432/wsb_test npm test
@@ -23,6 +24,7 @@ const config = {
   serverUrl: null
 }
 
+let unlockDatabase
 let db, store, webhooksModule, dispatcherModule, secretsModule, cipher, server, serverUrl
 let responder = () => 200
 const hits = []
@@ -48,6 +50,7 @@ before(async () => {
   dispatcherModule = await import('../../webhookDispatcher.js')
   secretsModule = await import('../../secrets.js')
   cipher = secretsModule.createHeaderCipher('chave-de-teste-do-outbox')
+  unlockDatabase = await lockDatabase(db.pool)
   await db.migrate()
 
   server = http.createServer((req, res) => {
@@ -77,6 +80,7 @@ before(async () => {
 after(async () => {
   if (skip) return
   await db.pool.query('DELETE FROM wa_sessions WHERE id = $1', [SESSION])
+  await unlockDatabase?.()
   await db.pool.end()
   await new Promise((resolve) => server.close(resolve))
 })

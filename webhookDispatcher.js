@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { isJidGroup } from 'baileys'
 import { isMediaMessage } from './inbound.js'
 import { MAX_CONCURRENT_DOWNLOADS } from './media.js'
 import { HeaderDecryptError } from './secrets.js'
@@ -45,6 +46,9 @@ export function classifyResult({ statusCode, error }) {
   if (NON_RETRYABLE.has(statusCode)) return 'failed'
   return 'retry' // 408, 429, 5xx e o resto
 }
+
+// Eventos de mensagem que ganham data.groupSubject quando a conversa é grupo.
+const GROUP_SUBJECT_EVENTS = new Set(['MESSAGES_UPSERT', 'SEND_MESSAGE'])
 
 // Eventos que não valem retentativa: o QR expira em ~20s e é a credencial
 // de pareamento da conta — repeti-lo por 45 min só aumentaria a exposição.
@@ -210,8 +214,9 @@ const ELIGIBLE = `((x.status = 'pending' AND x.next_attempt_at <= now())
  *           mediaTimeoutMs, retentionDays, serverUrl }
  * cipher: decifra os cabeçalhos gravados (secrets.js)
  * media:  { download(sock, sessionId, data) → Buffer } (opcional)
+ * groups: { getSubject(sessionId, jid) → string | null, timeoutMs } (opcional, groupMetadata.js)
  */
-export function createDispatcher({ pool, cipher, getSocket = () => undefined, config, media = null, log = console }) {
+export function createDispatcher({ pool, cipher, getSocket = () => undefined, config, media = null, groups = null, log = console }) {
   if (!cipher) throw new Error('createDispatcher: informe o cipher dos cabeçalhos (secrets.js)')
   const inFlight = new Set()
   // Entregas em andamento por webhook, neste processo. Sem esse limite, um
@@ -230,7 +235,10 @@ export function createDispatcher({ pool, cipher, getSocket = () => undefined, co
   // uma folga. Se o processo morrer no meio, a linha volta a ser elegível
   // quando o lease vencer (em vez de ficar presa pra sempre).
   const leaseMs =
-    config.timeoutMs + config.mediaTimeoutMs * Math.ceil(config.concurrency / MAX_CONCURRENT_DOWNLOADS) + 30_000
+    config.timeoutMs +
+    config.mediaTimeoutMs * Math.ceil(config.concurrency / MAX_CONCURRENT_DOWNLOADS) +
+    (groups?.timeoutMs ?? 0) +
+    30_000
 
   // Reivindica até `limit` entregas vencidas de UM webhook. FOR UPDATE SKIP
   // LOCKED deixa duas réplicas (ou dois lotes) pegarem linhas diferentes sem
@@ -361,7 +369,16 @@ export function createDispatcher({ pool, cipher, getSocket = () => undefined, co
     }
 
     let data = row.payload
+    // Nome do grupo, como a mídia, só no envio: o outbox guarda o data sem
+    // ele, e uma retentativa recalcula (pela memória/banco, sem consultar o
+    // WhatsApp de novo). Espera limitada ao timeout; sem nome, vai null e a
+    // entrega segue. Corre em paralelo ao download da mídia.
+    const groupSubject =
+      groups && GROUP_SUBJECT_EVENTS.has(row.event) && isJidGroup(data?.key?.remoteJid)
+        ? groups.getSubject(row.session_id, data.key.remoteJid)
+        : undefined
     if (row.base64 && media && isMediaMessage(data?.messageType)) data = await withMedia(row.session_id, data)
+    if (groupSubject !== undefined) data = { ...data, groupSubject: (await groupSubject) ?? null }
 
     const { url, body } = buildEnvelope({
       event: row.event,

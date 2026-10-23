@@ -18,7 +18,7 @@ import makeWASocket, {
 } from 'baileys'
 import { pool, migrate } from './db.js'
 import { usePostgresAuthState, wipeAuthState } from './postgresAuthState.js'
-import { makePnResolver, normalizeKeyAddressing } from './lid.js'
+import { makePnResolver, normalizeKeyAddressing, normalizeContextInfoAddressing } from './lid.js'
 import {
   shouldProcess,
   prepareMessage,
@@ -32,6 +32,7 @@ import { createHeaderCipher } from './secrets.js'
 import { createWebhookService } from './webhooks.js'
 import { createDispatcher } from './webhookDispatcher.js'
 import { createMediaDownloader } from './media.js'
+import { createGroupMetadataCache } from './groupMetadata.js'
 import webhookRoutes from './webhookRoutes.js'
 import {
   LIST_BIZ_NODE,
@@ -162,6 +163,19 @@ if (WEBHOOK_HEADERS_KEY !== null && WEBHOOK_HEADERS_KEY.length < 16) {
 // limpeza horária apaga mensagens gravadas há mais de N dias. Não é default
 // pra não apagar histórico de quem já conta com ele.
 const MESSAGE_RETENTION_DAYS = numberFromEnv('MESSAGE_RETENTION_DAYS', 0, { min: 0, integer: true })
+
+// Nome dos grupos (data.groupSubject nos webhooks e no histórico), em cache
+// de memória → wa_groups → consulta ao WhatsApp (groupMetadata.js). Defaults
+// e o porquê de cada um no .env.example.
+const GROUP_METADATA_CONFIG = {
+  ttlMs: numberFromEnv('GROUP_METADATA_TTL_MS', 21_600_000, { min: 1 }),
+  failureTtlMs: numberFromEnv('GROUP_METADATA_FAILURE_TTL_MS', 300_000, { min: 0 }),
+  timeoutMs: numberFromEnv('GROUP_METADATA_TIMEOUT_MS', 3_000, { min: 1 })
+}
+const GROUP_HISTORY_LIMITS = {
+  maxLookups: numberFromEnv('GROUP_METADATA_HISTORY_MAX_LOOKUPS', 10, { min: 0, integer: true }),
+  budgetMs: numberFromEnv('GROUP_METADATA_HISTORY_BUDGET_MS', 5_000, { min: 0 })
+}
 
 // Nomes legíveis pro enum numérico do baileys (ERROR=0, PENDING=1,
 // SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5), pra devolver na API em vez
@@ -321,8 +335,20 @@ async function respondWithMessageStatus(res, messageId, statusPromise) {
 // Normaliza a key do jeito que o listener de messages.upsert faz (LID → PN,
 // sem sufixo de dispositivo), pra que a gravação pela rota e o eco do
 // Baileys caiam na mesma linha de wa_messages.
+function addressingOptions(sock) {
+  return { resolvePn: makePnResolver(sock), ownJids: [sock.user?.id, sock.user?.lid] }
+}
+
 function normalizeKey(sock, key) {
-  return normalizeKeyAddressing(key, { resolvePn: makePnResolver(sock), ownJids: [sock.user?.id, sock.user?.lid] })
+  return normalizeKeyAddressing(key, addressingOptions(sock))
+}
+
+// Mesma troca LID → PN para quem foi citado e mencionado (contextInfo),
+// antes de gravar: o resultado vai pro histórico e pros webhooks.
+async function prepareNormalizedMessage(sock, received, { instanceId, key }) {
+  const data = prepareMessage(received, { instanceId, key })
+  data.contextInfo = await normalizeContextInfoAddressing(data.contextInfo, addressingOptions(sock))
+  return data
 }
 
 // Grava em wa_messages (origin = 'api') uma mensagem que acabou de ser
@@ -332,7 +358,7 @@ function normalizeKey(sock, key) {
 async function recordApiMessage(id, entry, fullMsg) {
   if (!fullMsg?.key?.id || !fullMsg.message) return
   const key = await normalizeKey(entry.sock, fullMsg.key)
-  const data = prepareMessage(fullMsg, { instanceId: id, key })
+  const data = await prepareNormalizedMessage(entry.sock, fullMsg, { instanceId: id, key })
   await saveMessage(id, data, 'api', { onInserted: (client, row) => enqueueMessageEvent(client, id, row) })
 }
 
@@ -370,7 +396,7 @@ async function processIncomingMessage(id, entry, sock, received, upsertType) {
     return
   }
 
-  const data = prepareMessage(received, { instanceId: id, key })
+  const data = await prepareNormalizedMessage(sock, received, { instanceId: id, key })
   const origin = classifyOrigin(key, entry.apiMessageIds)
   await saveMessage(id, data, origin, { onInserted: (client, row) => enqueueMessageEvent(client, id, row) })
 }
@@ -447,12 +473,24 @@ const media = createMediaDownloader({
   cacheMaxBytes: WEBHOOK_CONFIG.mediaCacheMaxBytes
 })
 const headerCipher = createHeaderCipher(WEBHOOK_HEADERS_KEY ?? API_KEY)
+// Só consulta o WhatsApp com a sessão conectada; fora isso, memória e banco.
+// Nos logs só o JID do grupo, nunca o nome (dado do usuário).
+const groups = createGroupMetadataCache({
+  pool,
+  getSocket: (id) => {
+    const entry = sessions.get(id)
+    return entry?.status === 'connected' ? entry.sock : undefined
+  },
+  config: GROUP_METADATA_CONFIG,
+  log: { info: console.log, warn: console.warn, debug: () => {} }
+})
 const dispatcher = createDispatcher({
   pool,
   cipher: headerCipher,
   getSocket: (id) => sessions.get(id)?.sock,
   config: WEBHOOK_CONFIG,
-  media
+  media,
+  groups
 })
 const webhooks = createWebhookService({ pool, cipher: headerCipher, onEnqueue: () => dispatcher.wake() })
 
@@ -620,7 +658,11 @@ async function startSession(id) {
     // 512 mensagens por 5 minutos, ver enableRecentMessageCache, ligado por
     // padrão — e consulta ele antes de chamar nosso getMessage. Mantemos o
     // nosso mesmo assim como rede de segurança pra retries fora dessa janela.)
-    getMessage: async (key) => entry.sentMessages.get(key.id)
+    getMessage: async (key) => entry.sentMessages.get(key.id),
+    // Metadata de grupo já conhecido (groups.upsert ou consulta anterior), pro
+    // Baileys não consultar o grupo de novo a cada envio. Só responde com o
+    // metadata completo (com participants); sem isso ele mesmo consulta.
+    cachedGroupMetadata: groups.cachedGroupMetadata(id)
     // (Nota: printQRInTerminal foi removido — está deprecated na doc atual;
     // já escutamos o campo `qr` no connection.update abaixo.)
   })
@@ -658,6 +700,13 @@ async function startSession(id) {
       }
     }
   })
+
+  // Nome dos grupos: entrou num grupo (upsert), renomeado ou sincronização
+  // completa (update) e mudança de participantes (descarta a lista em memória). Gravam
+  // em wa_groups sem bloquear o socket; nunca lançam.
+  sock.ev.on('groups.upsert', (list) => groups.onGroupsUpsert(id, list))
+  sock.ev.on('groups.update', (updates) => groups.onGroupsUpdate(id, updates))
+  sock.ev.on('group-participants.update', (update) => groups.onParticipantsUpdate(id, update))
 
   // Recibos de status (MESSAGES_UPDATE). Convive com o listener temporário
   // de waitForMessageStatus, que só existe durante a espera de um envio.
@@ -733,6 +782,7 @@ async function startSession(id) {
       entry.name = sock.user?.name ?? null
       reconnectAttempts.set(id, 0)
       clearConnectingWatchdog(id)
+      groups.onConnected(id)
       await setSessionStatus(id, 'connected', entry.jid, entry.name)
       console.log(`[${id}] conectado como ${entry.jid} (${entry.name ?? 'sem nome de perfil'})`)
     }
@@ -890,7 +940,10 @@ app.use('/sessions', (req, res, next) =>
 
 // Configurações, histórico e webhooks por instância (webhookRoutes.js). Tem
 // que vir depois do middleware acima: herda a exigência de x-api-key.
-app.use('/sessions/:id', webhookRoutes({ sessions, pool, webhooks, dispatcher, media }))
+app.use(
+  '/sessions/:id',
+  webhookRoutes({ sessions, pool, webhooks, dispatcher, media, groups, historyLimits: GROUP_HISTORY_LIMITS })
+)
 
 // Conecta (ou reconecta) uma sessão. O :id é o número, só dígitos com DDI.
 app.post('/sessions/:id/connect', async (req, res) => {
@@ -989,6 +1042,7 @@ app.delete('/sessions/:id', async (req, res) => {
   // O CASCADE leva junto mensagens, webhooks e entregas pendentes (FR-026).
   const { rowCount } = await pool.query('DELETE FROM wa_sessions WHERE id = $1', [id])
   webhooks.invalidate(id)
+  groups.forgetSession(id)
 
   // Sem sessão em memória E sem linha no banco: nunca existiu (ou já tinha
   // sido removida antes). Antes disso a rota respondia "removed" sempre,

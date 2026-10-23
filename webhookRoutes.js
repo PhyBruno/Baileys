@@ -4,12 +4,14 @@ import { listMessages, findMessageByKeyId, webhookDataFromRow } from './messageS
 import { validateWebhookInput } from './webhooks.js'
 import { isMediaMessage, normalizeContentShape, unwrapMessage } from './inbound.js'
 import { buildBase64Response } from './media.js'
+import { distinctGroupJids, withGroupSubjects } from './groupMetadata.js'
 
 // Rotas novas por instância (contrato em
 // docs/contracts/rest-api.md), montadas em
 // /sessions/:id DEPOIS do middleware de x-api-key do server.js — por isso
 // nenhuma delas checa a chave de novo. O estado do server.js chega por deps
-// (sem import circular): { sessions, pool, webhooks, dispatcher, media }.
+// (sem import circular): { sessions, pool, webhooks, dispatcher, media,
+// groups, historyLimits }.
 
 const DELIVERY_STATUSES = ['pending', 'delivering', 'delivered', 'failed']
 
@@ -45,7 +47,21 @@ function parseRemoteJid(raw) {
   return NUMBER_FORMAT.test(value) ? `${value}@s.whatsapp.net` : undefined
 }
 
-export default function webhookRoutes({ sessions, pool, webhooks, dispatcher, media }) {
+/**
+ * groupSubject (nome ATUAL do grupo) nos itens de grupo de uma página do
+ * histórico. Cada grupo distinto da página é resolvido uma vez só, num lote
+ * (groupMetadata.js); limits = { maxLookups, budgetMs } limita as consultas
+ * ao WhatsApp desta requisição — o que passar fica null. Paginação e ordem
+ * não mudam, e item individual não ganha o campo.
+ */
+export async function addGroupSubjects(groups, sessionId, page, limits = {}) {
+  const jids = distinctGroupJids(page.items)
+  if (!groups || jids.length === 0) return page
+  const subjects = await groups.resolveSubjects(sessionId, jids, limits)
+  return { ...page, items: withGroupSubjects(page.items, subjects) }
+}
+
+export default function webhookRoutes({ sessions, pool, webhooks, dispatcher, media, groups = null, historyLimits = {} }) {
   const router = express.Router({ mergeParams: true })
 
   // Sessão que existe no banco (viva ou não neste processo). Responde 404 e
@@ -110,7 +126,8 @@ export default function webhookRoutes({ sessions, pool, webhooks, dispatcher, me
 
       const session = await loadSession(req, res)
       if (!session) return
-      res.json(await listMessages(session.id, { remoteJid, limit, before }))
+      const page = await listMessages(session.id, { remoteJid, limit, before })
+      res.json(await addGroupSubjects(groups, session.id, page, historyLimits))
     })
   )
 

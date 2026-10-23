@@ -65,6 +65,19 @@ CREATE INDEX IF NOT EXISTS wa_messages_conversation_idx
 CREATE INDEX IF NOT EXISTS wa_messages_session_id_idx ON wa_messages (session_id, id DESC);
 CREATE INDEX IF NOT EXISTS wa_messages_created_at_idx ON wa_messages (created_at);
 
+-- Nome (subject) dos grupos que a sessão já viu: só o mapeamento JID -> nome,
+-- segunda camada do cache de groupMetadata.js (a primeira é a memória). Vem de
+-- groups.upsert/groups.update e das consultas ao WhatsApp; é o que deixa o
+-- histórico mostrar o nome com a sessão desconectada. O nome NÃO é gravado em
+-- wa_messages nem no outbox: webhook e histórico resolvem na hora (nome atual).
+CREATE TABLE IF NOT EXISTS wa_groups (
+  session_id TEXT NOT NULL REFERENCES wa_sessions(id) ON DELETE CASCADE,
+  jid        TEXT NOT NULL,                -- ex: 120363000000000000@g.us
+  subject    TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (session_id, jid)
+);
+
 -- Webhooks cadastrados por instância (N por sessão; a Evolution só permite 1).
 CREATE TABLE IF NOT EXISTS wa_webhooks (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),

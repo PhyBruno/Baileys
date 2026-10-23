@@ -13,9 +13,11 @@ import {
   signJwtHS256,
   buildWebhookJwt,
   redactUrl,
-  formatError
+  formatError,
+  createDispatcher
 } from '../webhookDispatcher.js'
 import { prepareMessage } from '../inbound.js'
+import { createGroupMetadataCache } from '../groupMetadata.js'
 
 const RETRY = { initialDelayMs: 5000, maxDelayMs: 300_000 }
 
@@ -239,4 +241,188 @@ test('formatError descreve timeout e rede sem cabeçalhos nem URL', () => {
   const withUrl = new TypeError('Request cannot be constructed from a URL that includes credentials: https://u:s3cret@x.example/h?token=ABC')
   const text = formatError(withUrl, {})
   assert.equal(/s3cret|token=ABC|x\.example/.test(text), false, text)
+})
+
+// ---------------- (h) data.groupSubject no envio ----------------
+
+const GROUP = '120363000000000000@g.us'
+const silentLog = { info() {}, warn() {}, debug() {}, error() {} }
+
+// Outbox em memória: entende só as consultas de claim e de resultado do createDispatcher.
+function fakeOutbox(deliveries) {
+  const updates = []
+  return {
+    updates,
+    async query(sql, params) {
+      if (sql.includes('SELECT x.webhook_id')) {
+        const ids = [...new Set(deliveries.filter((d) => d.status === 'pending').map((d) => d.webhook_id))]
+        return { rows: ids.map((webhook_id) => ({ webhook_id })) }
+      }
+      if (sql.includes('WITH claimed')) {
+        const [limit, , webhookId] = params
+        const rows = deliveries.filter((d) => d.status === 'pending' && d.webhook_id === webhookId).slice(0, limit)
+        for (const d of rows) {
+          d.status = 'delivering'
+          d.attempts++
+        }
+        return {
+          rows: rows.map((d) => ({ ...d, url: 'https://receptor.example/hook', base64: false, by_events: false, headers: {}, session_jid: null }))
+        }
+      }
+      if (sql.includes('UPDATE wa_webhook_deliveries')) {
+        updates.push(params)
+        deliveries.find((d) => d.id === params[0]).status = sql.match(/status = '(\w+)'/)[1]
+        return { rows: [], rowCount: 1 }
+      }
+      throw new Error(`consulta inesperada: ${sql}`)
+    }
+  }
+}
+
+const delivery = (id, event, remoteJid) => ({
+  id,
+  webhook_id: 'w1',
+  session_id: '5511900000001',
+  event,
+  status: 'pending',
+  attempts: 0,
+  payload: { key: { remoteJid, fromMe: false, id: `K${id}` }, message: { conversation: 'oi' }, messageType: 'conversation' }
+})
+
+// fetch substituído: guarda o corpo de cada POST e responde o status de responder(n).
+async function withFetch(responder, fn) {
+  const original = globalThis.fetch
+  const posts = []
+  globalThis.fetch = async (url, options) => {
+    posts.push(JSON.parse(options.body))
+    return { status: responder(posts.length), body: null }
+  }
+  try {
+    return await fn(posts)
+  } finally {
+    globalThis.fetch = original
+  }
+}
+
+const DISPATCHER_CONFIG = {
+  timeoutMs: 1000,
+  concurrency: 5,
+  concurrencyPerWebhook: 5,
+  retryMaxAttempts: 15,
+  retryInitialDelayMs: 5000,
+  retryMaxDelayMs: 300_000,
+  mediaTimeoutMs: 1000
+}
+const noCipher = { decryptHeaders: () => ({}) }
+
+const dispatcherWith = (deliveries, groups) => {
+  const pool = fakeOutbox(deliveries)
+  return { pool, dispatcher: createDispatcher({ pool, cipher: noCipher, config: DISPATCHER_CONFIG, groups, log: silentLog }) }
+}
+
+// Cache de grupos real (groupMetadata.js) sobre um wa_groups vazio e um
+// socket cujo groupMetadata responde answer(jid).
+const groupCache = (calls, answer) =>
+  createGroupMetadataCache({
+    pool: { query: async () => ({ rows: [] }) },
+    getSocket: () => ({
+      groupMetadata: async (jid) => {
+        calls.push(jid)
+        return answer(jid)
+      }
+    }),
+    config: { timeoutMs: 50 },
+    log: silentLog
+  })
+
+test('messages.upsert e send.message de grupo ganham data.groupSubject; individual não', async () => {
+  const calls = []
+  const groups = groupCache(calls, (jid) => ({ id: jid, subject: 'Grupo Exemplo' }))
+  const deliveries = [
+    delivery(1, 'MESSAGES_UPSERT', GROUP),
+    delivery(2, 'SEND_MESSAGE', GROUP),
+    delivery(3, 'MESSAGES_UPSERT', '5511988887777@s.whatsapp.net')
+  ]
+  const { pool, dispatcher } = dispatcherWith(deliveries, groups)
+  await withFetch(
+    () => 200,
+    async (posts) => {
+      await dispatcher.processBatch()
+      const byKey = Object.fromEntries(posts.map((body) => [body.data.key.id, body.data]))
+      assert.equal(byKey.K1.groupSubject, 'Grupo Exemplo')
+      assert.equal(byKey.K2.groupSubject, 'Grupo Exemplo')
+      assert.equal('groupSubject' in byKey.K3, false, 'conversa individual não ganha o campo')
+    }
+  )
+  assert.equal(calls.length, 1, 'um grupo, uma consulta')
+  assert.ok(deliveries.every((d) => d.status === 'delivered'))
+  for (const d of deliveries) assert.equal('groupSubject' in d.payload, false, 'o payload do outbox não muda')
+  assert.equal(JSON.stringify(pool.updates).includes('groupSubject'), false, 'nenhuma gravação leva o nome')
+})
+
+test('consulta do nome falhando: groupSubject null e a entrega acontece', async () => {
+  const groups = groupCache([], () => {
+    throw new Error('rate-overlimit')
+  })
+  const deliveries = [delivery(1, 'MESSAGES_UPSERT', GROUP)]
+  const { dispatcher } = dispatcherWith(deliveries, groups)
+  await withFetch(
+    () => 200,
+    async (posts) => {
+      await dispatcher.processBatch()
+      assert.equal(posts.length, 1)
+      assert.equal(posts[0].data.groupSubject, null)
+    }
+  )
+  assert.equal(deliveries[0].status, 'delivered')
+})
+
+test('consulta do nome sem resposta não segura a entrega além do timeout', async () => {
+  const groups = groupCache([], () => new Promise(() => {}))
+  const deliveries = [delivery(1, 'MESSAGES_UPSERT', GROUP)]
+  const { dispatcher } = dispatcherWith(deliveries, groups)
+  const started = Date.now()
+  await withFetch(
+    () => 200,
+    async (posts) => {
+      await dispatcher.processBatch()
+      assert.equal(posts[0].data.groupSubject, null)
+    }
+  )
+  assert.ok(Date.now() - started < 500)
+  assert.equal(deliveries[0].status, 'delivered')
+})
+
+test('retentativa recalcula o nome sem consultar o WhatsApp de novo', async () => {
+  const calls = []
+  const groups = groupCache(calls, (jid) => ({ id: jid, subject: 'Grupo Exemplo' }))
+  const deliveries = [delivery(1, 'MESSAGES_UPSERT', GROUP)]
+  const { dispatcher } = dispatcherWith(deliveries, groups)
+  await withFetch(
+    (n) => (n === 1 ? 503 : 200),
+    async (posts) => {
+      await dispatcher.processBatch()
+      assert.equal(deliveries[0].status, 'pending', '503 agenda retentativa')
+      await dispatcher.processBatch()
+      assert.equal(deliveries[0].status, 'delivered')
+      assert.deepEqual(
+        posts.map((body) => body.data.groupSubject),
+        ['Grupo Exemplo', 'Grupo Exemplo']
+      )
+    }
+  )
+  assert.equal(calls.length, 1)
+  assert.equal('groupSubject' in deliveries[0].payload, false)
+})
+
+test('sem o cache de grupos, o data sai como antes', async () => {
+  const deliveries = [delivery(1, 'MESSAGES_UPSERT', GROUP)]
+  const { dispatcher } = dispatcherWith(deliveries, null)
+  await withFetch(
+    () => 200,
+    async (posts) => {
+      await dispatcher.processBatch()
+      assert.deepEqual(posts[0].data, deliveries[0].payload)
+    }
+  )
 })

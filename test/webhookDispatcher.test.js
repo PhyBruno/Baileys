@@ -426,3 +426,25 @@ test('sem o cache de grupos, o data sai como antes', async () => {
     }
   )
 })
+
+test('retentativa depois de falha na consulta respeita o cache negativo', async () => {
+  const calls = []
+  const groups = groupCache(calls, () => {
+    throw new Error('rate-overlimit')
+  })
+  const deliveries = [delivery(1, 'MESSAGES_UPSERT', GROUP)]
+  const { dispatcher } = dispatcherWith(deliveries, groups)
+  await withFetch(
+    (n) => (n === 1 ? 503 : 200),
+    async (posts) => {
+      await dispatcher.processBatch()
+      await dispatcher.processBatch()
+      assert.deepEqual(
+        posts.map((body) => body.data.groupSubject),
+        [null, null]
+      )
+    }
+  )
+  assert.equal(calls.length, 1, 'a retentativa não consulta o WhatsApp de novo dentro do cache negativo')
+  assert.equal(deliveries[0].status, 'delivered')
+})

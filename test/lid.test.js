@@ -270,3 +270,16 @@ test('grupo com participant em número e sem contextInfo: contextInfo segue null
   const { stored } = await storedAndSent('group-pn-participant', {})
   assert.equal(stored, null)
 })
+
+test('contextInfo: LID repetido nas menções é consultado uma vez; muitas menções funcionam', async () => {
+  const seen = []
+  const resolvePn = async (lid) => (seen.push(lid), lid === PEER_LID ? PEER_PN : null)
+  const many = Array.from({ length: 45 }, (_, i) => `${100000000000000 + i}@lid`)
+  const ctx = { mentionedJid: [PEER_LID, OTHER_PN, PEER_LID, ...many] }
+  const out = await normalizeContextInfoAddressing(ctx, { resolvePn, ownJids })
+  assert.equal(seen.filter((lid) => lid === PEER_LID).length, 1)
+  assert.equal(seen.length, 46)
+  assert.deepEqual(out.mentionedJid.slice(0, 3), [PEER_PN, OTHER_PN, PEER_PN])
+  assert.deepEqual(out.mentionedJidAlt.slice(0, 3), [PEER_LID, null, PEER_LID])
+  assert.equal(out.mentionedJidAlt.length, ctx.mentionedJid.length)
+})

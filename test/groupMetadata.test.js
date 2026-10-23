@@ -339,3 +339,82 @@ test('histórico: filtro remoteJid=<grupo> resolve uma vez; página sem grupo sa
   const individual = { items: [item(PEER, 'x')], nextBefore: null }
   assert.equal(await addGroupSubjects(groups, SESSION, individual), individual)
 })
+
+// ---------------- correções da revisão ----------------
+
+test('WhatsApp lento: o limite de 3 vale até a resposta real, e consulta abandonada na fila não roda', async () => {
+  const sock = fakeSocket(async (jid) => (await sleep(80), { id: jid, subject: jid }))
+  const groups = cache({ sock, config: { timeoutMs: 20 } })
+  const jids = Array.from({ length: 9 }, (_, i) => `12036300000000020${i}@g.us`)
+  const subjects = await groups.resolveSubjects(SESSION, jids)
+  assert.ok([...subjects.values()].every((s) => s === null), 'todos desistiram no timeout')
+  await sleep(150)
+  assert.equal(sock.maxActive, 3, 'nunca mais de 3 consultas ao mesmo tempo')
+  assert.equal(sock.calls.length, 3, 'as 6 da fila foram descartadas: ninguém esperava mais')
+})
+
+test('timeout põe o grupo no cache negativo', async () => {
+  const sock = fakeSocket(() => new Promise(() => {}))
+  const groups = cache({ sock, config: { timeoutMs: 20 } })
+  assert.equal(await groups.getSubject(SESSION, G1), null)
+  assert.equal(await groups.getSubject(SESSION, G1), null)
+  assert.equal(sock.calls.length, 1)
+})
+
+test('resposta atrasada do WhatsApp não sobrescreve o nome novo vindo de groups.update', async () => {
+  const pool = fakePool()
+  const sock = fakeSocket(async (jid) => (await sleep(60), { id: jid, subject: 'ANTIGO', participants: [] }))
+  const groups = cache({ pool, sock, config: { timeoutMs: 20 } })
+  assert.equal(await groups.getSubject(SESSION, G1), null)
+  await groups.onGroupsUpdate(SESSION, [{ id: G1, subject: 'NOVO' }])
+  await sleep(70)
+  await settle()
+  assert.equal(await groups.getSubject(SESSION, G1), 'NOVO')
+  assert.equal(pool.rows.get(`${SESSION} ${G1}`).subject, 'NOVO')
+})
+
+test('leitura do banco que começou antes de um groups.update não volta o nome antigo', async () => {
+  const pool = fakePool([{ session_id: SESSION, jid: G1, subject: 'ANTIGO' }])
+  const select = pool.query.bind(pool)
+  pool.query = async (sql, params) => {
+    if (sql.startsWith('SELECT')) {
+      const answer = await select(sql, params)
+      await sleep(30)
+      return answer
+    }
+    return select(sql, params)
+  }
+  const groups = cache({ pool })
+  const pending = groups.getSubject(SESSION, G1)
+  await sleep(5)
+  await groups.onGroupsUpdate(SESSION, [{ id: G1, subject: 'NOVO' }])
+  assert.equal(await pending, 'NOVO')
+  assert.equal(await groups.getSubject(SESSION, G1), 'NOVO')
+})
+
+test('cachedGroupMetadata: lista de participantes vence antes do nome; sincronização por groups.update alimenta', async () => {
+  let clock = 1_000
+  const groups = cache({ config: { metadataTtlMs: 100 }, now: () => clock })
+  const full = { id: G1, subject: 'Grupo Um', participants: [{ id: PEER }] }
+  await groups.onGroupsUpdate(SESSION, [full])
+  const cached = groups.cachedGroupMetadata(SESSION)
+  assert.deepEqual(await cached(G1), full)
+  clock += 101
+  assert.equal(await cached(G1), undefined, 'lista velha: o Baileys consulta')
+  assert.equal(await groups.getSubject(SESSION, G1), 'Grupo Um', 'o nome continua')
+})
+
+test('onConnected descarta listas de participantes e o cache negativo da sessão', async () => {
+  let fail = true
+  const sock = fakeSocket((jid) => {
+    if (fail) throw new Error('Connection Closed')
+    return { id: jid, subject: 'Voltou' }
+  })
+  const groups = cache({ sock })
+  await groups.onGroupsUpsert(SESSION, [{ id: G1, subject: 'Grupo Um', participants: [] }])
+  assert.equal(await groups.getSubject(SESSION, G2), null)
+  groups.onConnected(SESSION)
+  fail = false
+  assert.equal(await groups.cachedGroupMetadata(SESSION)(G1), undefined)
+  assert.equal(await groups.getSubject(SESSION, G2), 'Voltou', 'cache negativo limpo na reconexão')
+})

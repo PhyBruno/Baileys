@@ -20,8 +20,15 @@ export const GROUP_METADATA_DEFAULTS = {
   failureTtlMs: 300_000,
   timeoutMs: 3_000,
   maxEntries: 2_000,
-  maxConcurrent: 3
+  maxConcurrent: 3,
+  // Validade da lista de participantes servida ao Baileys (cachedGroupMetadata).
+  // Bem menor que a do nome: se um group-participants.update se perder, um
+  // envio ao grupo não fica horas com a lista velha.
+  metadataTtlMs: 300_000
 }
+
+// Teto do cache negativo (todas as sessões). Passou disso, os mais antigos saem.
+const MAX_FAILURES = 10_000
 
 const TIMEOUT = Symbol('timeout')
 
@@ -48,22 +55,31 @@ export function withGroupSubjects(items, subjects) {
 /**
  * pool:      pg Pool (wa_groups)
  * getSocket: (sessionId) → socket CONECTADO ou undefined (sem socket, só L1 e L2)
- * config:    { ttlMs, failureTtlMs, timeoutMs, maxEntries, maxConcurrent }
+ * config:    { ttlMs, failureTtlMs, timeoutMs, maxEntries, maxConcurrent, metadataTtlMs }
  */
 export function createGroupMetadataCache({ pool, getSocket = () => undefined, config = {}, log = console, now = Date.now }) {
-  const { ttlMs, failureTtlMs, timeoutMs, maxEntries, maxConcurrent } = { ...GROUP_METADATA_DEFAULTS, ...config }
+  const { ttlMs, failureTtlMs, timeoutMs, maxEntries, maxConcurrent, metadataTtlMs } = {
+    ...GROUP_METADATA_DEFAULTS,
+    ...config
+  }
   const debug = log.debug?.bind(log) ?? (() => {})
 
-  // sessionId → Map<jid, { subject, metadata, expiresAt }>. metadata é o
-  // GroupMetadata completo (L3 ou groups.upsert), servido ao Baileys pelo
-  // cachedGroupMetadata; do L2 só vem o subject.
+  // sessionId → Map<jid, { subject, expiresAt, metadata, metadataExpiresAt }>.
+  // metadata é o GroupMetadata completo (L3, groups.upsert ou a sincronização
+  // de groups.update), servido ao Baileys pelo cachedGroupMetadata; do L2 só
+  // vem o subject.
   const memory = new Map()
   // "<sessionId> <jid>" → validade do cache negativo (L3 falhou)
   const failures = new Map()
-  // "<sessionId> <jid>" → Promise<string | null> da consulta L3 em andamento
+  // "<sessionId> <jid>" → { promise, neededUntil } da consulta L3 em andamento
   const flights = new Map()
   // sessionId → { active, queue } — limite de consultas L3 simultâneas
   const slots = new Map()
+  // "<sessionId> <jid>" → número de sequência da última troca de nome por
+  // evento (groups.upsert/update). Uma leitura (L2 ou L3) que começou antes
+  // disso é velha e não pode sobrescrever o nome novo.
+  const renamed = new Map()
+  let sequence = 0
 
   const flightId = (sessionId, jid) => `${sessionId} ${jid}`
 
@@ -73,11 +89,10 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
     const previous = groups.get(jid)
     // delete + set: o grupo vai pro fim da ordem de inserção (mais novo).
     groups.delete(jid)
-    groups.set(jid, {
-      subject,
-      metadata: metadata === undefined ? (previous?.metadata ?? null) : metadata,
-      expiresAt: now() + ttlMs
-    })
+    const entry = { subject, expiresAt: now() + ttlMs, metadata: null, metadataExpiresAt: 0 }
+    if (metadata) Object.assign(entry, { metadata, metadataExpiresAt: now() + metadataTtlMs })
+    else if (metadata === undefined && previous) Object.assign(entry, { metadata: previous.metadata, metadataExpiresAt: previous.metadataExpiresAt })
+    groups.set(jid, entry)
     while (groups.size > maxEntries) groups.delete(groups.keys().next().value)
   }
 
@@ -90,6 +105,20 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
       return undefined
     }
     return hit
+  }
+
+  function markRenamed(id) {
+    renamed.delete(id)
+    renamed.set(id, ++sequence)
+    while (renamed.size > MAX_FAILURES) renamed.delete(renamed.keys().next().value)
+  }
+
+  const renamedSince = (id, mark) => (renamed.get(id) ?? 0) > mark
+
+  function setFailure(id) {
+    failures.delete(id)
+    failures.set(id, now() + failureTtlMs)
+    while (failures.size > MAX_FAILURES) failures.delete(failures.keys().next().value)
   }
 
   function recentlyFailed(id) {
@@ -124,12 +153,17 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
     }
   }
 
-  function learn(sessionId, jid, metadata) {
-    if (typeof metadata?.subject !== 'string') return false
+  // Resposta do L3 → L1 e L2. Se o grupo foi renomeado por evento depois que
+  // a consulta começou (mark), a resposta é velha: vale o nome do evento.
+  // Retorna o subject atual, ou null se a resposta não tinha subject.
+  function learn(sessionId, jid, metadata, mark) {
+    if (typeof metadata?.subject !== 'string') return null
+    const id = flightId(sessionId, jid)
+    failures.delete(id)
+    if (renamedSince(id, mark)) return fromMemory(sessionId, jid)?.subject ?? metadata.subject
     remember(sessionId, jid, metadata.subject, Array.isArray(metadata.participants) ? metadata : null)
-    failures.delete(flightId(sessionId, jid))
     persist(sessionId, new Map([[jid, metadata.subject]]))
-    return true
+    return metadata.subject
   }
 
   function acquire(sessionId) {
@@ -149,52 +183,63 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
     else if (--slot.active === 0) slots.delete(sessionId)
   }
 
+  // A consulta em si. A vaga fica presa até o WhatsApp responder de verdade
+  // (o próprio Baileys tem timeout de query), pra o limite de simultâneas
+  // valer mesmo com o WhatsApp lento. Quem pediu espera no máximo o próprio
+  // prazo (lookup); passado timeoutMs sem resposta, o grupo entra no cache
+  // negativo, e uma resposta que chegue depois ainda é gravada.
+  async function runLookup(sessionId, jid, sock, flight) {
+    const id = flightId(sessionId, jid)
+    await acquire(sessionId)
+    try {
+      // Na fila, todo mundo que esperava pode ter desistido: não consulta à toa.
+      if (now() >= flight.neededUntil) return null
+      // Pode ter chegado por groups.update enquanto esperava a vaga.
+      const cached = fromMemory(sessionId, jid)
+      if (cached) return cached.subject
+
+      const mark = sequence
+      const slow = setTimeout(() => {
+        setFailure(id)
+        log.warn(`[${sessionId}] grupo ${jid}: WhatsApp não respondeu em ${timeoutMs}ms — nome fica null por ${failureTtlMs}ms`)
+      }, timeoutMs)
+      let metadata
+      try {
+        metadata = await sock.groupMetadata(jid)
+      } catch (err) {
+        // rate-overlimit, grupo inexistente, sem permissão... tudo conta como falha.
+        setFailure(id)
+        log.warn(`[${sessionId}] grupo ${jid}: consulta ao WhatsApp falhou (${err.message}) — nome fica null por ${failureTtlMs}ms`)
+        return null
+      } finally {
+        clearTimeout(slow)
+      }
+      const subject = learn(sessionId, jid, metadata, mark)
+      if (subject === null) {
+        setFailure(id)
+        log.warn(`[${sessionId}] grupo ${jid}: consulta ao WhatsApp sem subject — nome fica null por ${failureTtlMs}ms`)
+        return null
+      }
+      log.info(`[${sessionId}] grupo ${jid}: nome obtido do WhatsApp`)
+      return subject
+    } finally {
+      release(sessionId)
+      flights.delete(id)
+    }
+  }
+
   // L3, single-flight: pedidos simultâneos do mesmo grupo esperam a mesma
-  // consulta. A vaga fica presa no máximo timeoutMs; uma resposta que chega
-  // depois disso ainda é gravada (a próxima entrega acha no L1/L2).
-  function lookup(sessionId, jid, sock) {
+  // consulta, cada um até o próprio prazo (wait).
+  function lookup(sessionId, jid, sock, wait) {
     const id = flightId(sessionId, jid)
     let flight = flights.get(id)
-    if (flight) return flight
-
-    flight = (async () => {
-      await acquire(sessionId)
-      try {
-        // Pode ter chegado por groups.update enquanto esperava a vaga.
-        const cached = fromMemory(sessionId, jid)
-        if (cached) return cached.subject
-
-        const query = Promise.resolve().then(() => sock.groupMetadata(jid))
-        const result = await withTimeout(
-          query.then(
-            (metadata) => ({ metadata }),
-            (error) => ({ error })
-          ),
-          timeoutMs
-        )
-
-        if (result === TIMEOUT) {
-          failures.set(id, now() + failureTtlMs)
-          log.warn(`[${sessionId}] grupo ${jid}: WhatsApp não respondeu em ${timeoutMs}ms — nome fica null por ${failureTtlMs}ms`)
-          query.then((metadata) => learn(sessionId, jid, metadata)).catch(() => {})
-          return null
-        }
-        // rate-overlimit, grupo inexistente, sem permissão... tudo conta como falha.
-        if (result.error || !learn(sessionId, jid, result.metadata)) {
-          failures.set(id, now() + failureTtlMs)
-          const reason = result.error ? result.error.message : 'resposta sem subject'
-          log.warn(`[${sessionId}] grupo ${jid}: consulta ao WhatsApp falhou (${reason}) — nome fica null por ${failureTtlMs}ms`)
-          return null
-        }
-        log.info(`[${sessionId}] grupo ${jid}: nome obtido do WhatsApp`)
-        return result.metadata.subject
-      } finally {
-        release(sessionId)
-        flights.delete(id)
-      }
-    })()
-    flights.set(id, flight)
-    return flight
+    if (!flight) {
+      flight = { neededUntil: 0 }
+      flight.promise = runLookup(sessionId, jid, sock, flight).catch(() => null)
+      flights.set(id, flight)
+    }
+    flight.neededUntil = Math.max(flight.neededUntil, now() + wait)
+    return withTimeout(flight.promise, wait, null)
   }
 
   /**
@@ -225,10 +270,14 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
       }
       if (missing.length === 0) return result
 
+      const mark = sequence
       const stored = await fromDatabase(sessionId, missing)
       const pending = []
       for (const jid of missing) {
-        if (stored.has(jid)) {
+        if (renamedSince(flightId(sessionId, jid), mark) && fromMemory(sessionId, jid)) {
+          // Renomeado enquanto o SELECT rodava: o banco pode ter o nome velho.
+          result.set(jid, fromMemory(sessionId, jid).subject)
+        } else if (stored.has(jid)) {
           remember(sessionId, jid, stored.get(jid))
           result.set(jid, stored.get(jid))
           debug(`[${sessionId}] grupo ${jid}: nome no banco (L2)`)
@@ -247,8 +296,7 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
           const wait = budgetMs === null ? timeoutMs : budgetMs - (now() - started)
           if (wait <= 0) return
           lookups++
-          const subject = await withTimeout(lookup(sessionId, jid, sock), wait, null)
-          result.set(jid, subject)
+          result.set(jid, await lookup(sessionId, jid, sock, wait))
         })
       )
     } catch (err) {
@@ -269,39 +317,52 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
 
     /**
      * cachedGroupMetadata do makeWASocket (Baileys 7.0.0-rc14:
-     * (jid) => Promise<GroupMetadata | undefined>). Só responde da memória e
-     * só com o metadata completo: sem participants o Baileys consulta o grupo
-     * ele mesmo, que é o certo pra quem só tem o nome vindo do banco.
+     * (jid) => Promise<GroupMetadata | undefined>). Só responde da memória, só
+     * com o metadata completo e dentro de metadataTtlMs: fora disso o Baileys
+     * consulta o grupo ele mesmo, como fazia antes.
      */
     cachedGroupMetadata(sessionId) {
-      return async (jid) => fromMemory(sessionId, jid)?.metadata ?? undefined
+      return async (jid) => {
+        const hit = fromMemory(sessionId, jid)
+        return hit?.metadata && hit.metadataExpiresAt > now() ? hit.metadata : undefined
+      }
     },
 
-    /** groups.upsert: GroupMetadata[] (entrou num grupo, ou sincronização). */
+    /** groups.upsert: GroupMetadata[] (entrou num grupo). */
     onGroupsUpsert(sessionId, list) {
       const subjects = new Map()
       for (const metadata of list ?? []) {
         if (!metadata?.id || typeof metadata.subject !== 'string') continue
+        const id = flightId(sessionId, metadata.id)
         remember(sessionId, metadata.id, metadata.subject, Array.isArray(metadata.participants) ? metadata : null)
-        failures.delete(flightId(sessionId, metadata.id))
+        failures.delete(id)
+        markRenamed(id)
         subjects.set(metadata.id, metadata.subject)
       }
       return persist(sessionId, subjects)
     },
 
-    /** groups.update: Partial<GroupMetadata>[] — troca o nome quando ele vem. */
+    /**
+     * groups.update: Partial<GroupMetadata>[] — troca o nome quando ele vem.
+     * A sincronização do Baileys (groupFetchAllParticipating) também chega
+     * por aqui, com o metadata completo (participants incluso).
+     */
     onGroupsUpdate(sessionId, updates) {
       const subjects = new Map()
       for (const update of updates ?? []) {
         if (!update?.id) continue
+        const id = flightId(sessionId, update.id)
         const current = memory.get(sessionId)?.get(update.id)
-        const metadata = current?.metadata ? { ...current.metadata, ...update } : undefined
+        const metadata =
+          Array.isArray(update.participants) || current?.metadata ? { ...(current?.metadata ?? {}), ...update } : undefined
         if (typeof update.subject === 'string') {
           remember(sessionId, update.id, update.subject, metadata)
-          failures.delete(flightId(sessionId, update.id))
+          failures.delete(id)
+          markRenamed(id)
           subjects.set(update.id, update.subject)
         } else if (current && metadata) {
           current.metadata = metadata
+          if (Array.isArray(update.participants)) current.metadataExpiresAt = now() + metadataTtlMs
         }
       }
       return persist(sessionId, subjects)
@@ -317,10 +378,21 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
       if (current) current.metadata = null
     },
 
+    /**
+     * Conexão (re)aberta: o que mudou nos grupos com a sessão fora do ar pode
+     * não ter chegado. Descarta as listas de participantes e o cache negativo
+     * (uma falha por conexão caída não segura o nome por mais 5 min); os
+     * nomes ficam.
+     */
+    onConnected(sessionId) {
+      for (const entry of memory.get(sessionId)?.values() ?? []) entry.metadata = null
+      for (const id of failures.keys()) if (id.startsWith(`${sessionId} `)) failures.delete(id)
+    },
+
     /** Sessão removida: o CASCADE apaga wa_groups, aqui sai a memória. */
     forgetSession(sessionId) {
       memory.delete(sessionId)
-      for (const id of failures.keys()) if (id.startsWith(`${sessionId} `)) failures.delete(id)
+      for (const map of [failures, renamed]) for (const id of map.keys()) if (id.startsWith(`${sessionId} `)) map.delete(id)
     }
   }
 }

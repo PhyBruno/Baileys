@@ -701,8 +701,8 @@ async function startSession(id) {
     }
   })
 
-  // Nome dos grupos: entrou num grupo / sincronização (upsert), renomeado
-  // (update) e mudança de participantes (descarta a lista em memória). Gravam
+  // Nome dos grupos: entrou num grupo (upsert), renomeado ou sincronização
+  // completa (update) e mudança de participantes (descarta a lista em memória). Gravam
   // em wa_groups sem bloquear o socket; nunca lançam.
   sock.ev.on('groups.upsert', (list) => groups.onGroupsUpsert(id, list))
   sock.ev.on('groups.update', (updates) => groups.onGroupsUpdate(id, updates))
@@ -782,6 +782,7 @@ async function startSession(id) {
       entry.name = sock.user?.name ?? null
       reconnectAttempts.set(id, 0)
       clearConnectingWatchdog(id)
+      groups.onConnected(id)
       await setSessionStatus(id, 'connected', entry.jid, entry.name)
       console.log(`[${id}] conectado como ${entry.jid} (${entry.name ?? 'sem nome de perfil'})`)
     }

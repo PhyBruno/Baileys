@@ -147,6 +147,9 @@ export async function normalizeKeyAddressing(key, { resolvePn, ownJids = [] } = 
   return out
 }
 
+// Consultas LID → PN simultâneas por mensagem, nas menções.
+const MENTION_LOOKUP_BATCH = 20
+
 /**
  * Mesma troca LID → PN para quem foi citado (contextInfo.participant) e
  * mencionado (contextInfo.mentionedJid[]). Em grupo os dois chegam só como
@@ -176,18 +179,23 @@ export async function normalizeContextInfoAddressing(contextInfo, { resolvePn, o
     }
 
     if (Array.isArray(contextInfo.mentionedJid) && contextInfo.mentionedJid.length > 0) {
-      // Em paralelo: uma menção a muitas pessoas não soma a espera de cada lookup.
-      const resolved = await Promise.all(
-        contextInfo.mentionedJid.map(async (jid) => {
-          const lid = typeof jid === 'string' ? normalizeUser(jid) : undefined
-          if (!lid || !isLidJid(lid)) return null
-          const pn = await pnFor(lid, undefined, resolvePn)
-          return pn ? { pn, lid } : null
-        })
-      )
-      if (resolved.some(Boolean)) {
-        out.mentionedJid = contextInfo.mentionedJid.map((jid, i) => resolved[i]?.pn ?? jid)
-        out.mentionedJidAlt = resolved.map((swap) => swap?.lid ?? null)
+      const lids = contextInfo.mentionedJid.map((jid) => {
+        const lid = typeof jid === 'string' ? normalizeUser(jid) : undefined
+        return lid && isLidJid(lid) ? lid : null
+      })
+      // Cada LID distinto uma vez, em lotes paralelos: uma menção a muitas
+      // pessoas (ex.: todos de um grupo grande) não soma a espera de cada
+      // lookup nem dispara centenas de consultas ao mesmo tempo.
+      const unique = [...new Set(lids.filter(Boolean))]
+      const pns = new Map()
+      for (let i = 0; i < unique.length; i += MENTION_LOOKUP_BATCH) {
+        const batch = unique.slice(i, i + MENTION_LOOKUP_BATCH)
+        const found = await Promise.all(batch.map((lid) => pnFor(lid, undefined, resolvePn)))
+        batch.forEach((lid, j) => found[j] && pns.set(lid, found[j]))
+      }
+      if (pns.size > 0) {
+        out.mentionedJid = contextInfo.mentionedJid.map((jid, i) => pns.get(lids[i]) ?? jid)
+        out.mentionedJidAlt = lids.map((lid) => (pns.has(lid) ? lid : null))
       }
     }
 

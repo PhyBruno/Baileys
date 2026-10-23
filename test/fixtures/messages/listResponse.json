@@ -1,0 +1,34 @@
+{
+  "key": {
+    "remoteJid": "5511988887777@s.whatsapp.net",
+    "remoteJidAlt": "123456789012345@lid",
+    "addressingMode": "pn",
+    "fromMe": false,
+    "id": "A016B2C3D4E5F60718293A4B5C6D7E8F"
+  },
+  "messageTimestamp": 1792750000,
+  "pushName": "Maria Exemplo",
+  "broadcast": false,
+  "message": {
+    "listResponseMessage": {
+      "title": "Opção 2",
+      "listType": 1,
+      "singleSelectReply": {
+        "selectedRowId": "opt-2"
+      },
+      "contextInfo": {
+        "stanzaId": "3EB0LIST00000000000001",
+        "participant": "5511900000001@s.whatsapp.net",
+        "quotedMessage": {
+          "listMessage": {
+            "title": "Escolha",
+            "description": "Uma opção",
+            "buttonText": "Ver opções",
+            "listType": 1
+          }
+        }
+      },
+      "description": "Segunda opção"
+    }
+  }
+}

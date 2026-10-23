@@ -49,6 +49,27 @@ services:
       - CONNECTING_TIMEOUT_MS=45000
       ## Timeout de confirmação de status de mensagem enviada
       - MESSAGE_STATUS_TIMEOUT_MS=8000
+      ## URL pública da bridge (campo "server_url" dos webhooks; vazio = null)
+      - SERVER_URL=${SERVER_URL:-}
+      ## Webhooks: timeout, concorrência e polling da fila de entregas
+      - WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS:-10000}
+      - WEBHOOK_CONCURRENCY=${WEBHOOK_CONCURRENCY:-10}
+      - WEBHOOK_CONCURRENCY_PER_WEBHOOK=${WEBHOOK_CONCURRENCY_PER_WEBHOOK:-2}
+      - WEBHOOK_POLL_INTERVAL_MS=${WEBHOOK_POLL_INTERVAL_MS:-1000}
+      ## Webhooks: retentativa com backoff (~45 min de janela com os defaults)
+      - WEBHOOK_RETRY_MAX_ATTEMPTS=${WEBHOOK_RETRY_MAX_ATTEMPTS:-15}
+      - WEBHOOK_RETRY_INITIAL_DELAY_MS=${WEBHOOK_RETRY_INITIAL_DELAY_MS:-5000}
+      - WEBHOOK_RETRY_MAX_DELAY_MS=${WEBHOOK_RETRY_MAX_DELAY_MS:-300000}
+      ## Webhooks: mídia em base64 (teto, timeout de download e cache em memória)
+      - WEBHOOK_MEDIA_MAX_BYTES=${WEBHOOK_MEDIA_MAX_BYTES:-20971520}
+      - WEBHOOK_MEDIA_TIMEOUT_MS=${WEBHOOK_MEDIA_TIMEOUT_MS:-30000}
+      - WEBHOOK_MEDIA_CACHE_MAX_BYTES=${WEBHOOK_MEDIA_CACHE_MAX_BYTES:-104857600}
+      ## Webhooks: dias de histórico de entregas concluídas
+      - WEBHOOK_DELIVERY_RETENTION_DAYS=${WEBHOOK_DELIVERY_RETENTION_DAYS:-7}
+      ## Cifra dos cabeçalhos dos webhooks no banco (vazio = derivada da API_KEY)
+      - WEBHOOK_HEADERS_KEY=${WEBHOOK_HEADERS_KEY:-}
+      ## Histórico de mensagens: apaga as com mais de N dias (0 = guarda pra sempre)
+      - MESSAGE_RETENTION_DAYS=${MESSAGE_RETENTION_DAYS:-0}
     deploy:
       mode: replicated
       replicas: 1

@@ -1,5 +1,8 @@
 import 'dotenv/config'
 import crypto from 'crypto'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import express from 'express'
 import QRCode from 'qrcode'
 import pino from 'pino'
@@ -9,11 +12,27 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   Browsers,
   WAMessageStatus,
+  generateMessageIDV2,
   generateWAMessageFromContent,
   prepareWAMessageMedia
 } from 'baileys'
 import { pool, migrate } from './db.js'
 import { usePostgresAuthState, wipeAuthState } from './postgresAuthState.js'
+import { makePnResolver, normalizeKeyAddressing } from './lid.js'
+import {
+  shouldProcess,
+  prepareMessage,
+  classifyOrigin,
+  parseProtocol,
+  createApiMessageRegistry,
+  statusName
+} from './inbound.js'
+import { saveMessage, applyProtocol, updateStatus, webhookDataFromRow, purgeOldMessages } from './messageStore.js'
+import { createHeaderCipher } from './secrets.js'
+import { createWebhookService } from './webhooks.js'
+import { createDispatcher } from './webhookDispatcher.js'
+import { createMediaDownloader } from './media.js'
+import webhookRoutes from './webhookRoutes.js'
 import {
   LIST_BIZ_NODE,
   BUTTONS_BIZ_NODE,
@@ -69,6 +88,11 @@ if (!Number.isFinite(CONNECTING_TIMEOUT_MS) || CONNECTING_TIMEOUT_MS < 0) {
 // real seria rejeitado com 413 antes de chegar na validação da rota.
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '20mb'
 
+// As demais rotas (configurações, webhooks, listas...) recebem JSON pequeno.
+// Limite próprio pra que só as rotas de mídia aceitem os 20MB: sem isso, uma
+// configuração de webhook podia gravar megabytes de cabeçalhos no banco.
+const SMALL_JSON_LIMIT = '256kb'
+
 // sock.sendMessage() resolve assim que a mensagem é repassada pro servidor do
 // WhatsApp (relay) — não quando o destinatário recebe de verdade. O status
 // real (aceito pelo servidor, entregue no aparelho, ou erro) chega depois,
@@ -82,6 +106,62 @@ if (!Number.isFinite(MESSAGE_STATUS_TIMEOUT_MS) || MESSAGE_STATUS_TIMEOUT_MS < 0
   console.error('ERRO: MESSAGE_STATUS_TIMEOUT_MS precisa ser um número >= 0 (0 desativa a espera).')
   process.exit(1)
 }
+
+// Envs numéricas novas (webhooks): mesmo padrão de validação das de cima,
+// num helper pra não repetir o bloco onze vezes.
+function numberFromEnv(name, defaultValue, { min = 0, integer = false } = {}) {
+  const value = Number(process.env[name] ?? defaultValue)
+  if (!Number.isFinite(value) || value < min || (integer && !Number.isInteger(value))) {
+    console.error(`ERRO: ${name} precisa ser um número${integer ? ' inteiro' : ''} >= ${min}.`)
+    process.exit(1)
+  }
+  return value
+}
+
+// URL pública da bridge, repassada como "server_url" nos webhooks.
+const SERVER_URL = process.env.SERVER_URL?.trim() || null
+
+// Repasse de mensagens pra webhooks (outbox em wa_webhook_deliveries). Os
+// defaults e o porquê de cada um estão no .env.example; em especial, 15
+// tentativas com backoff de 5s até 5min dão ~45 min de janela (a Evolution
+// usa 10, ~20 min, pouco pra um receptor ficar 30 min fora do ar).
+const WEBHOOK_CONFIG = {
+  serverUrl: SERVER_URL,
+  timeoutMs: numberFromEnv('WEBHOOK_TIMEOUT_MS', 10_000, { min: 1 }),
+  concurrency: numberFromEnv('WEBHOOK_CONCURRENCY', 10, { min: 1, integer: true }),
+  // Teto por webhook (dentro do global): um receptor lento não segura todas
+  // as vagas e não atrasa os webhooks das outras instâncias.
+  concurrencyPerWebhook: numberFromEnv('WEBHOOK_CONCURRENCY_PER_WEBHOOK', 2, { min: 1, integer: true }),
+  pollIntervalMs: numberFromEnv('WEBHOOK_POLL_INTERVAL_MS', 1_000, { min: 100 }),
+  retryMaxAttempts: numberFromEnv('WEBHOOK_RETRY_MAX_ATTEMPTS', 15, { min: 1, integer: true }),
+  retryInitialDelayMs: numberFromEnv('WEBHOOK_RETRY_INITIAL_DELAY_MS', 5_000, { min: 1 }),
+  retryMaxDelayMs: numberFromEnv('WEBHOOK_RETRY_MAX_DELAY_MS', 300_000, { min: 1 }),
+  mediaMaxBytes: numberFromEnv('WEBHOOK_MEDIA_MAX_BYTES', 20_971_520, { min: 0 }),
+  mediaTimeoutMs: numberFromEnv('WEBHOOK_MEDIA_TIMEOUT_MS', 30_000, { min: 1 }),
+  mediaCacheMaxBytes: numberFromEnv('WEBHOOK_MEDIA_CACHE_MAX_BYTES', 104_857_600, { min: 0 }),
+  retentionDays: numberFromEnv('WEBHOOK_DELIVERY_RETENTION_DAYS', 7, { min: 1 })
+}
+
+if (WEBHOOK_CONFIG.retryMaxDelayMs < WEBHOOK_CONFIG.retryInitialDelayMs) {
+  console.error('ERRO: WEBHOOK_RETRY_MAX_DELAY_MS precisa ser >= WEBHOOK_RETRY_INITIAL_DELAY_MS.')
+  process.exit(1)
+}
+
+// Chave da cifra dos cabeçalhos dos webhooks no banco (secrets.js). Sem ela,
+// a chave é derivada da API_KEY — funciona sem configuração, mas trocar a
+// API_KEY deixa os cabeçalhos salvos ilegíveis (as entregas desses webhooks
+// passam a falhar com aviso claro até os valores serem cadastrados de novo).
+// Definir WEBHOOK_HEADERS_KEY separa as duas coisas.
+const WEBHOOK_HEADERS_KEY = process.env.WEBHOOK_HEADERS_KEY?.trim() || null
+if (WEBHOOK_HEADERS_KEY !== null && WEBHOOK_HEADERS_KEY.length < 16) {
+  console.error('ERRO: WEBHOOK_HEADERS_KEY precisa ter pelo menos 16 caracteres (ex: openssl rand -hex 32).')
+  process.exit(1)
+}
+
+// Histórico de wa_messages: 0 (default) guarda pra sempre. Com N > 0, uma
+// limpeza horária apaga mensagens gravadas há mais de N dias. Não é default
+// pra não apagar histórico de quem já conta com ele.
+const MESSAGE_RETENTION_DAYS = numberFromEnv('MESSAGE_RETENTION_DAYS', 0, { min: 0, integer: true })
 
 // Nomes legíveis pro enum numérico do baileys (ERROR=0, PENDING=1,
 // SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5), pra devolver na API em vez
@@ -213,9 +293,12 @@ function cacheSentMessage(entry, messageId, message) {
 // O envio (sendMessage/relayMessage) já retornou — a mensagem foi repassada
 // ao servidor do WhatsApp —, mas isso não confirma entrega. Esperamos até
 // MESSAGE_STATUS_TIMEOUT_MS por uma atualização de status real antes de
-// responder — ver comentário de waitForMessageStatus.
-async function respondWithMessageStatus(res, sock, messageId) {
-  const statusCode = messageId ? await waitForMessageStatus(sock, messageId, MESSAGE_STATUS_TIMEOUT_MS) : null
+// responder — ver comentário de waitForMessageStatus. A espera chega pronta
+// (statusPromise), criada logo após o envio: se fosse criada só depois da
+// gravação em wa_messages, um SERVER_ACK rápido podia chegar antes do
+// listener e a resposta sairia "unknown" sem necessidade.
+async function respondWithMessageStatus(res, messageId, statusPromise) {
+  const statusCode = messageId ? await statusPromise : null
 
   if (statusCode === WAMessageStatus.ERROR) {
     return res.status(502).json({
@@ -232,6 +315,89 @@ async function respondWithMessageStatus(res, sock, messageId) {
     // 'unknown' quando o timeout estourou sem confirmação — não é falha,
     // só significa que a entrega ainda não foi confirmada nesse tempo.
     status: statusCode === null ? 'unknown' : MESSAGE_STATUS_NAMES[statusCode]
+  })
+}
+
+// Normaliza a key do jeito que o listener de messages.upsert faz (LID → PN,
+// sem sufixo de dispositivo), pra que a gravação pela rota e o eco do
+// Baileys caiam na mesma linha de wa_messages.
+function normalizeKey(sock, key) {
+  return normalizeKeyAddressing(key, { resolvePn: makePnResolver(sock), ownJids: [sock.user?.id, sock.user?.lid] })
+}
+
+// Grava em wa_messages (origin = 'api') uma mensagem que acabou de ser
+// enviada pela API. Roda sem await na rota, em paralelo à espera de status:
+// a gravação não pode atrasar a resposta HTTP (SC-007). Se o eco do Baileys
+// já tiver gravado a linha, o ON CONFLICT faz disto um no-op.
+async function recordApiMessage(id, entry, fullMsg) {
+  if (!fullMsg?.key?.id || !fullMsg.message) return
+  const key = await normalizeKey(entry.sock, fullMsg.key)
+  const data = prepareMessage(fullMsg, { instanceId: id, key })
+  await saveMessage(id, data, 'api', { onInserted: (client, row) => enqueueMessageEvent(client, id, row) })
+}
+
+// Pipeline de cada mensagem do messages.upsert: filtra, normaliza a key,
+// aplica edição/exclusão ou grava a mensagem nova.
+async function processIncomingMessage(id, entry, sock, received, upsertType) {
+  if (!shouldProcess(received, upsertType, { groupsIgnore: entry.groupsIgnore })) return
+
+  const key = await normalizeKey(sock, received.key)
+
+  const protocol = parseProtocol(received.message)
+  if (protocol) {
+    await applyProtocol(id, protocol, {
+      // Na mesma transação da atualização da linha original. Sem a original
+      // gravada, o evento sai com a key do protocolMessage: em conversa
+      // individual quem edita/apaga é o autor, então o fromMe do envelope é
+      // o da mensagem alvo.
+      onApplied: (client, row) => {
+        const targetKey = row
+          ? { remoteJid: row.key.remoteJid, fromMe: row.key.fromMe, id: row.key.id }
+          : { remoteJid: key.remoteJid, fromMe: Boolean(key.fromMe), id: protocol.key.id }
+        const messageId = row?.id ?? null
+        if (protocol.type === 'MESSAGE_EDIT') {
+          return webhooks.enqueue(
+            client,
+            id,
+            'MESSAGES_EDITED',
+            { key: targetKey, type: 'MESSAGE_EDIT', editedMessage: protocol.editedMessage },
+            { messageId }
+          )
+        }
+        return webhooks.enqueue(client, id, 'MESSAGES_DELETE', targetKey, { messageId })
+      }
+    })
+    return
+  }
+
+  const data = prepareMessage(received, { instanceId: id, key })
+  const origin = classifyOrigin(key, entry.apiMessageIds)
+  await saveMessage(id, data, origin, { onInserted: (client, row) => enqueueMessageEvent(client, id, row) })
+}
+
+// Mudança de status (enviada → entregue → lida) de uma mensagem gravada.
+// Os dados do evento saem da linha (remote_jid já normalizado no
+// recebimento), então não precisa normalizar a key do update de novo.
+async function processStatusUpdate(id, key, code) {
+  const status = statusName(code)
+  if (!status || !key?.id) return
+  await updateStatus(id, key.id, key.fromMe, status, {
+    onUpdated: (client, row) =>
+      webhooks.enqueue(
+        client,
+        id,
+        'MESSAGES_UPDATE',
+        {
+          messageId: String(row.id),
+          keyId: row.key_id,
+          remoteJid: row.remote_jid,
+          fromMe: row.from_me,
+          participant: row.participant,
+          status,
+          instanceId: id
+        },
+        { messageId: row.id }
+      )
   })
 }
 
@@ -266,8 +432,58 @@ function decodeBase64Media(raw) {
 }
 
 // Estado em memória das sessões vivas neste processo.
-// id -> { sock, status, qr, jid, intentionalDisconnect }
+// id -> { sock, status, qr, jid, name, intentionalDisconnect, sentMessages,
+//         groupsIgnore, apiMessageIds }
+// groupsIgnore espelha wa_sessions.groups_ignore pra não consultar o banco a
+// cada mensagem recebida (o PATCH /settings atualiza os dois).
 const sessions = new Map()
+
+// Webhooks: mídia sob demanda, worker do outbox e o serviço que cria as
+// entregas. O serviço acorda o dispatcher depois do COMMIT de cada enqueue,
+// então um aviso sai na hora, sem esperar o polling.
+const media = createMediaDownloader({
+  maxBytes: WEBHOOK_CONFIG.mediaMaxBytes,
+  timeoutMs: WEBHOOK_CONFIG.mediaTimeoutMs,
+  cacheMaxBytes: WEBHOOK_CONFIG.mediaCacheMaxBytes
+})
+const headerCipher = createHeaderCipher(WEBHOOK_HEADERS_KEY ?? API_KEY)
+const dispatcher = createDispatcher({
+  pool,
+  cipher: headerCipher,
+  getSocket: (id) => sessions.get(id)?.sock,
+  config: WEBHOOK_CONFIG,
+  media
+})
+const webhooks = createWebhookService({ pool, cipher: headerCipher, onEnqueue: () => dispatcher.wake() })
+
+// Evento de mensagem nova, chamado dentro da transação que inseriu a linha
+// (onInserted). Enviada pela API vira SEND_MESSAGE e nunca MESSAGES_UPSERT
+// (selectTargets também barra isso); como só quem insere chama este gancho,
+// o evento sai uma vez só, seja a rota ou o eco do Baileys quem gravou primeiro.
+function enqueueMessageEvent(client, id, row) {
+  const event = row.origin === 'api' ? 'SEND_MESSAGE' : 'MESSAGES_UPSERT'
+  return webhooks.enqueue(client, id, event, webhookDataFromRow(row), { messageId: row.id, origin: row.origin })
+}
+
+// Eventos sem mensagem (conexão, QR), fora de transação. Disparo sem await e
+// com erro só logado: falha de banco aqui nunca pode atrapalhar a máquina de
+// reconexão do handler de connection.update.
+function enqueueSessionEvent(id, event, buildData) {
+  Promise.resolve()
+    .then(buildData)
+    .then((data) => webhooks.enqueue(pool, id, event, data))
+    .catch((err) => console.error(`[${id}] falha ao enfileirar ${event}: ${err.message}`))
+}
+
+function connectionUpdateData(id, entry, state, statusReason) {
+  return {
+    instance: id,
+    wuid: entry.jid ? entry.jid.replace(/:\d+@/, '@') : null,
+    profileName: entry.name ?? null,
+    state,
+    statusReason: statusReason ?? null
+  }
+}
 
 // Controle de tentativas de reconexão por sessão (fora do "entry" pra sobreviver
 // a cada recriação de socket). id -> número de falhas consecutivas.
@@ -342,9 +558,12 @@ async function startSession(id) {
   clearReconnectTimer(id)
   clearConnectingWatchdog(id)
 
-  await pool.query(
+  const {
+    rows: [sessionRow]
+  } = await pool.query(
     `INSERT INTO wa_sessions (id, status) VALUES ($1, 'connecting')
-     ON CONFLICT (id) DO UPDATE SET status = 'connecting', updated_at = now()`,
+     ON CONFLICT (id) DO UPDATE SET status = 'connecting', updated_at = now()
+     RETURNING groups_ignore`,
     [id]
   )
 
@@ -360,7 +579,11 @@ async function startSession(id) {
     intentionalDisconnect: false,
     // Cache em memória, limitado, das últimas mensagens enviadas por esta sessão.
     // É o que alimenta o getMessage do baileys (ver comentário abaixo).
-    sentMessages: new Map()
+    sentMessages: new Map(),
+    groupsIgnore: sessionRow.groups_ignore,
+    // Ids das mensagens que as rotas de envio vão mandar, registrados ANTES
+    // do envio — ver createApiMessageRegistry em inbound.js.
+    apiMessageIds: createApiMessageRegistry()
   }
   sessions.set(id, entry)
 
@@ -381,10 +604,11 @@ async function startSession(id) {
     },
     logger,
     browser: Browsers.ubuntu('Bridge API'),
-    // Essa bridge não lê chat/histórico — só dispara mensagem. O default do
-    // baileys (syncFullHistory: true) baixa e decripta o histórico completo
-    // de conversas a cada pareamento novo, o que custa tempo e banda à toa
-    // pra um caso de uso que nunca vai consumir esse evento.
+    // A bridge recebe as mensagens NOVAS (messages.upsert → wa_messages →
+    // webhooks), mas não importa o histórico antigo de conversas. O default
+    // do baileys (syncFullHistory: true) baixa e decripta o histórico
+    // completo a cada pareamento novo, o que custa tempo e banda à toa e
+    // dispararia avisos de webhook de mensagens velhas.
     syncFullHistory: false,
     // getMessage: a documentação do baileys trata isso como praticamente
     // obrigatório — é o que permite reenviar uma mensagem quando o WhatsApp
@@ -422,6 +646,32 @@ async function startSession(id) {
 
   sock.ev.on('creds.update', saveCreds)
 
+  // Mensagens recebidas (e o eco das enviadas). Cada mensagem tem o próprio
+  // try/catch: uma mensagem malformada ou um erro de banco não pode
+  // interromper as outras do lote nem derrubar o socket.
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    for (const received of messages) {
+      try {
+        await processIncomingMessage(id, entry, sock, received, type)
+      } catch (err) {
+        console.error(`[${id}] falha ao processar mensagem recebida ${received?.key?.id ?? '?'}: ${err.message}`)
+      }
+    }
+  })
+
+  // Recibos de status (MESSAGES_UPDATE). Convive com o listener temporário
+  // de waitForMessageStatus, que só existe durante a espera de um envio.
+  sock.ev.on('messages.update', async (updates) => {
+    for (const { key, update } of updates) {
+      if (typeof update?.status !== 'number') continue
+      try {
+        await processStatusUpdate(id, key, update.status)
+      } catch (err) {
+        console.error(`[${id}] falha ao processar status da mensagem ${key?.id ?? '?'}: ${err.message}`)
+      }
+    }
+  })
+
   // O push name (nome de perfil) de uma conta PESSOAL não vem pronto no
   // momento em que a conexão abre — só contas Business recebem o nome já no
   // pair-success (nó <biz>, ver Utils/validate-connection.js). Pra conta
@@ -441,6 +691,29 @@ async function startSession(id) {
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
+    const disconnectCode = lastDisconnect?.error?.output?.statusCode
+
+    // Eventos de webhook da conexão (CONNECTION_UPDATE / QRCODE_UPDATED, no
+    // formato da Evolution). enqueueSessionEvent nunca lança nem espera o
+    // banco, então não interfere na lógica de reconexão abaixo. Só o socket
+    // atual da sessão avisa: o "close" atrasado de um socket já substituído
+    // (ex.: /connect logo depois de uma queda) chegaria ao receptor depois do
+    // "connecting" do novo e pareceria uma desconexão que não aconteceu.
+    const isCurrent = sessions.get(id) === entry
+    if (qr && isCurrent) {
+      enqueueSessionEvent(id, 'QRCODE_UPDATED', async () => ({
+        qrcode: { instance: id, pairingCode: null, code: qr, base64: await QRCode.toDataURL(qr) }
+      }))
+    }
+    if (connection === 'connecting' && isCurrent) {
+      enqueueSessionEvent(id, 'CONNECTION_UPDATE', () => connectionUpdateData(id, entry, 'connecting', null))
+    }
+    if (connection === 'open' && isCurrent) {
+      enqueueSessionEvent(id, 'CONNECTION_UPDATE', () => connectionUpdateData(id, entry, 'open', 200))
+    }
+    if (connection === 'close' && isCurrent) {
+      enqueueSessionEvent(id, 'CONNECTION_UPDATE', () => connectionUpdateData(id, entry, 'close', disconnectCode))
+    }
 
     if (qr) {
       entry.qr = qr
@@ -474,7 +747,7 @@ async function startSession(id) {
         return
       }
 
-      const statusCode = lastDisconnect?.error?.output?.statusCode
+      const statusCode = disconnectCode
       const loggedOut = statusCode === DisconnectReason.loggedOut
 
       if (loggedOut) {
@@ -546,10 +819,41 @@ async function restorePersistedSessions() {
 // ---------------------- API ----------------------
 
 const app = express()
-app.use(express.json({ limit: JSON_BODY_LIMIT }))
 
 // Health check sem autenticação, útil pra load balancer / orquestrador.
 app.get('/health', (req, res) => res.json({ ok: true }))
+
+// Tela de configuração (SPA em manager/, buildada no Dockerfile). Estáticos
+// públicos de propósito: não contêm dado nenhum — a tela pede a API key e
+// toda chamada dela vai pras rotas /sessions, que exigem x-api-key.
+// fileURLToPath em vez de .pathname: no Windows o .pathname vira "/C:/..." e
+// o caminho não resolve. O fallback usa o wildcard do Express 5
+// ("/manager/{*splat}"); "/manager/*" é inválido no path-to-regexp v8 e
+// derruba o boot.
+const MANAGER_DIST = fileURLToPath(new URL('./manager/dist', import.meta.url))
+if (fs.existsSync(MANAGER_DIST)) {
+  // A tela guarda a API key na aba: CSP restritivo (só scripts do próprio
+  // bundle) reduz o estrago de um eventual XSS, e frame-ancestors 'none'
+  // impede embutir a tela num iframe alheio (clickjacking). 'unsafe-inline'
+  // em style-src é exigido pelos estilos inline dos componentes Radix.
+  const managerSecurityHeaders = (res) => {
+    res.setHeader(
+      'Content-Security-Policy',
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    )
+    res.setHeader('X-Frame-Options', 'DENY')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('Referrer-Policy', 'no-referrer')
+  }
+  app.use('/manager', express.static(MANAGER_DIST, { setHeaders: managerSecurityHeaders }))
+  app.get('/manager/{*splat}', (req, res) => {
+    managerSecurityHeaders(res)
+    res.sendFile(path.join(MANAGER_DIST, 'index.html'))
+  })
+} else {
+  console.warn(`Tela /manager indisponível: ${MANAGER_DIST} não existe (rode "npm run build" em manager/).`)
+}
 
 function safeCompare(a, b) {
   const bufA = Buffer.from(String(a))
@@ -572,6 +876,21 @@ app.use('/sessions', (req, res, next) => {
   }
   next()
 })
+
+// O corpo só é lido DEPOIS da API key: antes, qualquer cliente sem chave
+// fazia o servidor ler e parsear até 20MB por requisição só pra receber 401.
+// Limite grande apenas nas rotas que recebem mídia em base64 (/messages e o
+// thumbnailUrl de /message/sendButtons).
+const MEDIA_UPLOAD_ROUTE = /^\/[^/]+\/(messages|message\/sendButtons)\/?$/
+const largeJson = express.json({ limit: JSON_BODY_LIMIT })
+const smallJson = express.json({ limit: SMALL_JSON_LIMIT })
+app.use('/sessions', (req, res, next) =>
+  (req.method === 'POST' && MEDIA_UPLOAD_ROUTE.test(req.path) ? largeJson : smallJson)(req, res, next)
+)
+
+// Configurações, histórico e webhooks por instância (webhookRoutes.js). Tem
+// que vir depois do middleware acima: herda a exigência de x-api-key.
+app.use('/sessions/:id', webhookRoutes({ sessions, pool, webhooks, dispatcher, media }))
 
 // Conecta (ou reconecta) uma sessão. O :id é o número, só dígitos com DDI.
 app.post('/sessions/:id/connect', async (req, res) => {
@@ -667,7 +986,9 @@ app.delete('/sessions/:id', async (req, res) => {
   clearConnectingWatchdog(id)
 
   await wipeAuthState(id)
+  // O CASCADE leva junto mensagens, webhooks e entregas pendentes (FR-026).
   const { rowCount } = await pool.query('DELETE FROM wa_sessions WHERE id = $1', [id])
+  webhooks.invalidate(id)
 
   // Sem sessão em memória E sem linha no banco: nunca existiu (ou já tinha
   // sido removida antes). Antes disso a rota respondia "removed" sempre,
@@ -688,7 +1009,7 @@ app.delete('/sessions/:id', async (req, res) => {
 // embutida no próprio request.
 app.post('/sessions/:id/messages', async (req, res) => {
   const id = normalizeNumber(req.params.id)
-  const { to, message, type = 'text', mediaBase64, mimetype, fileName, caption } = req.body
+  const { to, message, type = 'text', mediaBase64, mimetype, fileName, caption } = req.body ?? {}
 
   if (!to) {
     return res.status(400).json({ error: 'informe "to" no corpo' })
@@ -755,9 +1076,20 @@ app.post('/sessions/:id/messages', async (req, res) => {
       return res.status(404).json({ error: `número "${to}" não está registrado no WhatsApp (ou não foi possível confirmar)` })
     }
 
-    const result = await entry.sock.sendMessage(resolved.jid, content)
+    // Id gerado e registrado ANTES do envio: o sendMessage emite o eco
+    // (messages.upsert 'append') num nextTick antes de retornar, e o
+    // listener precisa reconhecer esse eco como 'api' (research R4). O
+    // ...options do Baileys sobrescreve o id que ele geraria sozinho.
+    const messageId = generateMessageIDV2(entry.sock.user.id)
+    entry.apiMessageIds.mark(messageId)
+
+    const result = await entry.sock.sendMessage(resolved.jid, content, { messageId })
+    const statusPromise = waitForMessageStatus(entry.sock, result?.key?.id, MESSAGE_STATUS_TIMEOUT_MS)
     cacheSentMessage(entry, result?.key?.id, result?.message)
-    await respondWithMessageStatus(res, entry.sock, result?.key?.id)
+    recordApiMessage(id, entry, result).catch((err) =>
+      console.error(`[${id}] falha ao gravar mensagem enviada ${result?.key?.id}: ${err.message}`)
+    )
+    await respondWithMessageStatus(res, result?.key?.id, statusPromise)
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -804,13 +1136,20 @@ async function sendInteractiveMessage(req, res, buildContent, bizNode) {
     // completa (id incluso) e mandamos pelo relayMessage, que é o que o
     // próprio sendMessage usa por baixo, com o <biz> em additionalNodes.
     const fullMsg = generateWAMessageFromContent(resolved.jid, built.message, { userJid: entry.sock.user.id })
+    // O relayMessage não emite eco próprio, mas o registro antes do envio
+    // mantém as duas rotas com a mesma garantia (research R4).
+    entry.apiMessageIds.mark(fullMsg.key.id)
     await entry.sock.relayMessage(resolved.jid, fullMsg.message, {
       messageId: fullMsg.key.id,
       additionalNodes: [bizNode]
     })
+    const statusPromise = waitForMessageStatus(entry.sock, fullMsg.key.id, MESSAGE_STATUS_TIMEOUT_MS)
 
     cacheSentMessage(entry, fullMsg.key.id, fullMsg.message)
-    await respondWithMessageStatus(res, entry.sock, fullMsg.key.id)
+    recordApiMessage(id, entry, fullMsg).catch((err) =>
+      console.error(`[${id}] falha ao gravar mensagem enviada ${fullMsg.key.id}: ${err.message}`)
+    )
+    await respondWithMessageStatus(res, fullMsg.key.id, statusPromise)
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -873,10 +1212,49 @@ app.post('/sessions/:id/message/sendButtons', async (req, res) => {
   )
 })
 
+// Erros que escapam das rotas (inclusive os do parser de JSON, que rodam
+// antes delas) saem no formato { error } da API em vez da página HTML
+// padrão do Express. O detalhe interno fica só no log.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err)
+  if (err.type === 'entity.too.large') {
+    const limit = MEDIA_UPLOAD_ROUTE.test(req.path.replace(/^\/sessions/, '')) ? JSON_BODY_LIMIT : SMALL_JSON_LIMIT
+    return res.status(413).json({ error: `corpo da requisição maior que o limite de ${limit} desta rota` })
+  }
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'corpo da requisição não é um JSON válido' })
+  }
+  console.error(`erro não tratado em ${req.method} ${req.path}:`, err)
+  res.status(err.status && err.status < 500 ? err.status : 500).json({ error: 'erro interno ao processar a requisição' })
+})
+
+// Limpeza horária de wa_messages (MESSAGE_RETENTION_DAYS > 0). Erro só é
+// logado: a limpeza nunca pode derrubar o processo.
+function startMessageRetention() {
+  const purge = async () => {
+    try {
+      const removed = await purgeOldMessages(MESSAGE_RETENTION_DAYS)
+      if (removed) console.log(`histórico: ${removed} mensagem(ns) com mais de ${MESSAGE_RETENTION_DAYS} dia(s) removida(s)`)
+    } catch (err) {
+      console.error(`histórico: falha na limpeza de mensagens antigas: ${err.message}`)
+    }
+  }
+  purge()
+  setInterval(purge, 60 * 60_000).unref()
+}
+
 async function main() {
   // migrate() TEM que terminar antes do listen(): senão uma requisição pode
   // chegar e consultar tabelas que ainda não existem.
   await migrate()
+  // Webhooks criados antes da cifra dos cabeçalhos ainda têm valores em texto
+  // puro: cifra antes de o dispatcher começar (idempotente).
+  const reencrypted = await webhooks.encryptLegacyHeaders()
+  if (reencrypted) console.log(`webhook: cabeçalhos de ${reencrypted} webhook(s) cifrados no banco`)
+  // Depois do migrate (as tabelas do outbox precisam existir) e antes das
+  // sessões: entregas que sobraram de antes do restart já voltam a sair.
+  dispatcher.start()
+  if (MESSAGE_RETENTION_DAYS > 0) startMessageRetention()
   // Bounded pelo timeout interno de resolveBaileysVersion — nunca trava o
   // boot indefinidamente mesmo se o GitHub estiver inacessível.
   await resolveBaileysVersion()
@@ -892,6 +1270,10 @@ main().catch((err) => {
 })
 
 process.on('SIGTERM', async () => {
+  // Espera os POSTs de webhook em andamento antes de fechar o pool: senão o
+  // resultado deles não seria gravado e a entrega só voltaria quando o lease
+  // vencesse (repetindo um aviso que talvez já tenha chegado).
+  await dispatcher.stop()
   await pool.end()
   process.exit(0)
 })

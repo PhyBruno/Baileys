@@ -1,0 +1,40 @@
+{
+  "key": {
+    "remoteJid": "5511988887777@s.whatsapp.net",
+    "remoteJidAlt": "123456789012345@lid",
+    "addressingMode": "pn",
+    "fromMe": false,
+    "id": "A009B2C3D4E5F60718293A4B5C6D7E8F"
+  },
+  "messageTimestamp": 1792750000,
+  "pushName": "Maria Exemplo",
+  "broadcast": false,
+  "message": {
+    "stickerMessage": {
+      "url": "https://mmg.whatsapp.net/v/t62.7118-24/00070_n.enc?ccb=11-4",
+      "fileSha256": {
+        "type": "Buffer",
+        "data": "RkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkY="
+      },
+      "fileEncSha256": {
+        "type": "Buffer",
+        "data": "R0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0c="
+      },
+      "mediaKey": {
+        "type": "Buffer",
+        "data": "SEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEg="
+      },
+      "directPath": "/v/t62.7118-24/00070_n.enc?ccb=11-4",
+      "mediaKeyTimestamp": {
+        "low": 1792749990,
+        "high": 0,
+        "unsigned": false
+      },
+      "mimetype": "image/webp",
+      "height": 512,
+      "width": 512,
+      "fileLength": 16384,
+      "isAnimated": false
+    }
+  }
+}

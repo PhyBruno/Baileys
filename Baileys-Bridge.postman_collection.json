@@ -1,14 +1,15 @@
 {
   "info": {
     "name": "WhatsApp Bridge API (Baileys + Postgres)",
-    "description": "Collection de exemplo para a bridge Baileys clonada em C:\\repos\\Baileys. Fluxo: connect -> qr -> messages (texto/imagem/video/documento) / message/sendList / message/sendButtons (payload da Evolution API; cabecalho texto ou imagem, corpo, rodape e botoes opcionais) -> disconnect -> connect -> delete. Ajuste as variaveis apiKey/sessionId/toNumber conforme seu ambiente.",
+    "description": "Collection de exemplo para a bridge Baileys clonada em C:\\repos\\Baileys. Fluxo: connect -> qr -> messages (texto/imagem/video/documento) / message/sendList / message/sendButtons (payload da Evolution API; cabecalho texto ou imagem, corpo, rodape e botoes opcionais) -> configuracoes, mensagens recebidas e webhooks -> disconnect -> connect -> delete. Ajuste as variaveis apiKey/sessionId/toNumber conforme seu ambiente.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     { "key": "baseUrl", "value": "http://localhost:3000", "type": "string" },
     { "key": "apiKey", "value": "troque-por-uma-chave-forte", "type": "string" },
     { "key": "sessionId", "value": "5511999999999", "type": "string" },
-    { "key": "toNumber", "value": "5511988887777", "type": "string" }
+    { "key": "toNumber", "value": "5511988887777", "type": "string" },
+    { "key": "webhookId", "value": "", "type": "string" }
   ],
   "item": [
     {
@@ -288,6 +289,228 @@
         }
       },
       "response": []
+    },
+    {
+      "name": "Configurações",
+      "description": "Configurações por instância. groupsIgnore (padrão true): mensagens de grupo não são gravadas nem repassadas.",
+      "item": [
+        {
+          "name": "Get settings",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "x-api-key", "value": "{{apiKey}}"}],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/settings",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "settings"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update settings (receber grupos)",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              { "key": "x-api-key", "value": "{{apiKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"groupsIgnore\":  false\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/settings",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "settings"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Mensagens",
+      "description": "Histórico das mensagens gravadas (formato data do messages.upsert da Evolution + origin) e mídia sob demanda.",
+      "item": [
+        {
+          "name": "List messages",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "x-api-key", "value": "{{apiKey}}"}],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/messages?remoteJid={{toNumber}}&limit=50",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "messages"],
+              "query": [{"key": "remoteJid", "value": "{{toNumber}}"}, {"key": "limit", "value": "50"}]
+            },
+            "description": "remoteJid (dígitos ou JID) é opcional. Para a próxima página, passe o nextBefore recebido em \"before\"."
+          },
+          "response": []
+        },
+        {
+          "name": "Get base64 from media message",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "x-api-key", "value": "{{apiKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": {\n    \"key\": {\n      \"id\": \"3EB0A1B2C3D4E5F60718\"\n    }\n  },\n  \"convertToMp4\": false\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/chat/getBase64FromMediaMessage",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "chat", "getBase64FromMediaMessage"]
+            },
+            "description": "Compatível com a Evolution. Aceita só a key.id (mensagem gravada) ou a mensagem inteira. convertToMp4 é ignorado."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Webhooks",
+      "description": "Até 10 webhooks por instância. Envelope e eventos compatíveis com a Evolution 2.4.0-rc2 (ver contracts/webhook-payload.md). \"Create webhook\" guarda o id em {{webhookId}}.",
+      "item": [
+        {
+          "name": "List webhooks",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "x-api-key", "value": "{{apiKey}}"}],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/webhooks",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "webhooks"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create webhook (mensagens recebidas, com mídia)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "x-api-key", "value": "{{apiKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://texteaseai.example/webhooks/wsb\",\n  \"enabled\": true,\n  \"events\": [\n    \"MESSAGES_UPSERT\"\n  ],\n  \"base64\": true,\n  \"byEvents\": false,\n  \"includeFromMe\": false,\n  \"headers\": {\n    \"Authorization\": \"Bearer token-do-receptor\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/webhooks",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "webhooks"]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) pm.collectionVariables.set('webhookId', pm.response.json().id)"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create webhook (todos os eventos, com JWT)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "x-api-key", "value": "{{apiKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://texteaseai.example/webhooks/wsb-eventos\",\n  \"events\": [\n    \"MESSAGES_UPSERT\",\n    \"SEND_MESSAGE\",\n    \"MESSAGES_UPDATE\",\n    \"MESSAGES_EDITED\",\n    \"MESSAGES_DELETE\",\n    \"CONNECTION_UPDATE\",\n    \"QRCODE_UPDATED\"\n  ],\n  \"byEvents\": true,\n  \"includeFromMe\": true,\n  \"headers\": {\n    \"jwt_key\": \"segredo-compartilhado-com-o-receptor\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/webhooks",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "webhooks"]
+            },
+            "description": "byEvents: cada evento vai para <url>/<evento-kebab>. jwt_key vira Authorization: Bearer <JWT HS256> e não é repassado."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) pm.collectionVariables.set('webhookId', pm.response.json().id)"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Update webhook (mantém header salvo)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "x-api-key", "value": "{{apiKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://texteaseai.example/webhooks/wsb\",\n  \"enabled\": true,\n  \"events\": [\n    \"MESSAGES_UPSERT\",\n    \"SEND_MESSAGE\"\n  ],\n  \"base64\": true,\n  \"byEvents\": false,\n  \"includeFromMe\": false,\n  \"headers\": {\n    \"Authorization\": \"••••\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/webhooks/{{webhookId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "webhooks", "{{webhookId}}"]
+            },
+            "description": "Substituição completa. \"••••\" mantém o valor já salvo do cabeçalho."
+          },
+          "response": []
+        },
+        {
+          "name": "Test webhook",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "x-api-key", "value": "{{apiKey}}"}],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/webhooks/{{webhookId}}/test",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "webhooks", "{{webhookId}}", "test"]
+            },
+            "description": "Envia event \"webhook.test\" na hora. Sempre 200: o resultado do receptor vem no corpo."
+          },
+          "response": []
+        },
+        {
+          "name": "List deliveries",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "x-api-key", "value": "{{apiKey}}"}],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/webhooks/{{webhookId}}/deliveries?status=failed&limit=50",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "webhooks", "{{webhookId}}", "deliveries"],
+              "query": [{"key": "status", "value": "failed"}, {"key": "limit", "value": "50"}]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Delete webhook",
+          "request": {
+            "method": "DELETE",
+            "header": [{"key": "x-api-key", "value": "{{apiKey}}"}],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/webhooks/{{webhookId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{sessionId}}", "webhooks", "{{webhookId}}"]
+            }
+          },
+          "response": []
+        }
+      ]
     },
     {
       "name": "Disconnect session",

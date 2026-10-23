@@ -1,8 +1,9 @@
 # WhatsApp Bridge API (Baileys + Postgres)
 
-Aplicação pequena e "burra" de propósito: só conecta, reconecta, desconecta e
-dispara mensagem por múltiplos números de WhatsApp. Toda a lógica de negócio
-fica na sua aplicação principal, que chama esta bridge por HTTP.
+Aplicação pequena e "burra" de propósito: conecta, reconecta, desconecta,
+dispara mensagem por múltiplos números de WhatsApp e repassa as mensagens
+recebidas para webhooks (no formato da Evolution API). Toda a lógica de
+negócio fica na sua aplicação principal, que chama esta bridge por HTTP.
 
 Cada número é uma sessão, identificada pelo próprio número. As credenciais
 (sessão do WhatsApp Web) ficam persistidas no **Postgres**, não em arquivo —
@@ -37,9 +38,10 @@ o destinatário (`number`) também aceita o JID de usuário, como na Evolution:
 createdb whatsapp_bridge
 ```
 
-As tabelas (`wa_sessions`, `wa_auth_state`) são criadas automaticamente na
-primeira vez que o servidor sobe (roda `schema.sql` via `CREATE TABLE IF NOT
-EXISTS`).
+As tabelas (`wa_sessions`, `wa_auth_state`, `wa_messages`, `wa_webhooks` e
+`wa_webhook_deliveries`) são criadas automaticamente toda vez que o servidor
+sobe (roda `schema.sql`, só com `CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF
+NOT EXISTS` — seguro sobre um banco já existente).
 
 ### 2. Variáveis de ambiente
 
@@ -52,8 +54,22 @@ API_KEY=troque-por-uma-chave-forte      # obrigatória, o servidor não sobe sem
 RECONNECT_MAX_ATTEMPTS=5                # tentativas de reconexão automática após queda
 RECONNECT_DELAY_MS=30000                # espera fixa entre cada tentativa (30s)
 CONNECTING_TIMEOUT_MS=45000             # força /disconnect sozinho se travar em "connecting" (0 desativa)
-JSON_BODY_LIMIT=20mb                    # limite do body JSON (imagem/documento em base64 precisa de mais que o default de 100kb)
+JSON_BODY_LIMIT=20mb                    # limite do body JSON nas rotas de mídia (/messages, /message/sendButtons); as demais aceitam até 256kb
 MESSAGE_STATUS_TIMEOUT_MS=8000          # quanto tempo /messages espera pela confirmação real de entrega (0 desativa)
+SERVER_URL=                             # URL pública da bridge, vai no "server_url" dos webhooks (vazio = null)
+WEBHOOK_TIMEOUT_MS=10000                # timeout de cada POST de webhook
+WEBHOOK_CONCURRENCY=10                  # POSTs de webhook simultâneos (todas as sessões)
+WEBHOOK_CONCURRENCY_PER_WEBHOOK=2       # teto por webhook: um receptor lento não segura as vagas dos outros
+WEBHOOK_POLL_INTERVAL_MS=1000           # polling de segurança da fila de entregas
+WEBHOOK_RETRY_MAX_ATTEMPTS=15           # tentativas antes de "failed" (~45 min de janela com os defaults)
+WEBHOOK_RETRY_INITIAL_DELAY_MS=5000     # primeiro atraso do backoff exponencial
+WEBHOOK_RETRY_MAX_DELAY_MS=300000       # teto do backoff (5 min)
+WEBHOOK_MEDIA_MAX_BYTES=20971520        # acima disso (20MB) a mídia não é embutida: base64Error "too_large"
+WEBHOOK_MEDIA_TIMEOUT_MS=30000          # timeout do download de mídia
+WEBHOOK_MEDIA_CACHE_MAX_BYTES=104857600 # teto do cache de mídia em memória (100MB)
+WEBHOOK_DELIVERY_RETENTION_DAYS=7       # histórico de entregas concluídas
+WEBHOOK_HEADERS_KEY=                    # chave da cifra dos cabeçalhos dos webhooks no banco (vazio = derivada da API_KEY)
+MESSAGE_RETENTION_DAYS=0                # apaga mensagens de wa_messages com mais de N dias (0 = guarda pra sempre)
 ```
 
 ### 3. Instalar e rodar
@@ -94,10 +110,12 @@ Python, nem gcc. O container roda como usuário não-root e não escreve nada em
 disco (todo o estado vive no Postgres), então não precisa de volume na
 bridge em si.
 
-> Não tive como testar o build de verdade neste ambiente (sem Docker e sem
-> acesso à registry aqui), então revise o build no seu ambiente antes de
-> confiar cegamente — mas validei a parte que mais costuma quebrar (a
-> dependência nativa) e a sintaxe do `docker-compose.yml`.
+A versão da imagem base é fixa (versão exata do Node + digest, no `ARG
+NODE_IMAGE` do `Dockerfile`), para que dois builds do mesmo commit saiam
+iguais. Atualizar é intencional: o próprio `Dockerfile` tem os comandos. O
+build é multi-stage: o primeiro estágio builda a tela `/manager`, e a imagem
+final leva só os `.js` da bridge, o `schema.sql`, as dependências de produção
+e os estáticos da tela.
 
 ## Autenticação
 
@@ -124,6 +142,17 @@ Todos abaixo (exceto `/health`) exigem `x-api-key` no header.
 | POST   | `/sessions/:id/messages`     | Dispara mensagem — texto, imagem, vídeo ou documento (ver formato abaixo). |
 | POST   | `/sessions/:id/message/sendList`    | Lista de opções — mesmo payload do `/message/sendList` da Evolution API. |
 | POST   | `/sessions/:id/message/sendButtons` | Botões — mesmo payload do `/message/sendButtons` da Evolution API.     |
+| GET    | `/sessions/:id/settings`     | Configurações da instância (`groupsIgnore`).                               |
+| PATCH  | `/sessions/:id/settings`     | Altera "ignorar grupos" (`{ "groupsIgnore": false }`).                     |
+| GET    | `/sessions/:id/messages`     | Histórico de mensagens recebidas/enviadas gravadas (ver "Mensagens recebidas"). |
+| GET    | `/sessions/:id/webhooks`     | Lista os webhooks da instância (cabeçalhos mascarados, última entrega). |
+| POST   | `/sessions/:id/webhooks`     | Cadastra webhook (até 10 por instância). Ver "Webhooks".                   |
+| PUT    | `/sessions/:id/webhooks/:webhookId` | Substitui a configuração do webhook.                               |
+| DELETE | `/sessions/:id/webhooks/:webhookId` | Remove o webhook (e as entregas pendentes dele).                   |
+| POST   | `/sessions/:id/webhooks/:webhookId/test` | Envia um `webhook.test` na hora e devolve o resultado.        |
+| GET    | `/sessions/:id/webhooks/:webhookId/deliveries` | Histórico de entregas (`?status=&limit=&before=`).      |
+| POST   | `/sessions/:id/chat/getBase64FromMediaMessage` | Baixa a mídia de uma mensagem recebida (compatível com a Evolution). |
+| GET    | `/manager`                   | Tela de configuração (estáticos públicos; dados só com API key).         |
 
 ### Enviando texto, imagem, vídeo ou documento
 
@@ -316,8 +345,9 @@ A bridge monta o proto (`listMessage` com `SINGLE_SELECT` /
 `interactive.js`. Isso é engenharia reversa: se o WhatsApp mudar o formato, a
 mensagem pode voltar a ser descartada sem erro (foi o que aconteceu com a
 Evolution em toda a 2.3.x). O `status` da resposta ajuda a perceber isso. A
-bridge **não** recebe a opção escolhida pelo usuário — não há webhook de
-mensagens recebidas.
+opção escolhida pelo usuário chega como mensagem recebida
+(`listResponseMessage`, `buttonsResponseMessage`, `templateButtonReplyMessage`
+ou `interactiveResponseMessage`) — ver "Mensagens recebidas" e "Webhooks".
 
 ### Exemplo de uso
 
@@ -360,6 +390,272 @@ curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/c
 # 6. logout definitivo (precisa escanear QR de novo pra usar esse número)
 curl -X DELETE -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999
 ```
+
+## Mensagens recebidas
+
+Toda mensagem nova de uma instância conectada é normalizada no formato
+`data` do webhook `messages.upsert` da **Evolution API 2.4.0-rc2**
+(`key`, `pushName`, `status`, `message`, `contextInfo`, `messageType`,
+`messageTimestamp`, `instanceId`, `source`) e gravada **uma única vez** em
+`wa_messages`. A deduplicação é por `(sessão, key.id, fromMe)`: reentregas
+do WhatsApp depois de uma reconexão não geram linha (nem aviso) repetido.
+
+Tipos cobertos: texto (inclusive com link ou citação, que viram
+`conversation`), imagem, áudio/voz, vídeo, vídeo-nota (`ptvMessage`),
+documento (com ou sem legenda, que vira `documentMessage`), sticker,
+localização, contato(s), reação (`text: ""` = reação removida), voto em
+enquete (cru, sem decriptar), respostas de lista/botão e mensagens
+temporárias/visualização única (desembrulhadas). Edição e exclusão "para
+todos" atualizam a mensagem original (`status` `EDITED` / `DELETED`) em vez de
+criar linha nova. Histórico antigo **não** é importado (`syncFullHistory:
+false`): só entra o que chegar depois que a instância conecta.
+
+Formato completo e exemplos por tipo:
+[`docs/contracts/webhook-payload.md`](docs/contracts/webhook-payload.md).
+Binários (`mediaKey`, `jpegThumbnail` etc.) saem como string base64.
+
+**Origem (`origin`)** — cada mensagem gravada tem uma de três origens:
+
+| `origin`  | O que é                                                         |
+|-----------|-----------------------------------------------------------------|
+| `inbound` | Enviada por outra pessoa para a instância.                       |
+| `device`  | Enviada pelo próprio número, por outro aparelho (celular, Web).  |
+| `api`     | Enviada por esta bridge (`/messages`, `/message/sendList`, `/message/sendButtons`). |
+
+As rotas de envio geram o id da mensagem **antes** de enviar e o registram em
+memória, então o eco que o Baileys devolve é reconhecido como `api` — mesmo
+quando chega antes da gravação da própria rota. É isso que impede uma
+resposta enviada pelo Chatwoot (via API) de voltar como mensagem nova.
+
+**LID (número oculto)** — quando o WhatsApp identifica o contato por
+`<id>@lid`, a bridge troca para o número (`key.remoteJid` = número,
+`key.remoteJidAlt` = LID, `addressingMode: "pn"`), usando o que vem na
+mensagem ou o mapeamento LID→número que o próprio Baileys guarda. Se o
+número for desconhecido, a mensagem segue com `remoteJid: "...@lid"` e
+`addressingMode: "lid"`: quem consome precisa aceitar esse caso. Em grupo, a
+mesma regra vale para `key.participant`.
+
+**Ignorar grupos** — por instância, **ligado por padrão**. Com ele ligado,
+mensagens de grupo não são gravadas nem repassadas. Vale na hora para as
+próximas mensagens:
+
+```bash
+curl -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/settings
+# {"groupsIgnore":true}
+
+curl -X PATCH -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  http://localhost:3000/sessions/5511999999999/settings -d '{"groupsIgnore": false}'
+```
+
+**Histórico** — `GET /sessions/:id/messages?remoteJid=&limit=50&before=`
+devolve as mensagens gravadas, da mais nova para a mais antiga
+(`{ "items": [<data> + "origin"], "nextBefore": <id|null> }`). `remoteJid`
+aceita só dígitos ou um JID; `limit` vai de 1 a 200; para a próxima página,
+passe o `nextBefore` recebido em `before`. Por padrão o histórico não
+expira; com `MESSAGE_RETENTION_DAYS=N`, uma limpeza horária apaga as
+mensagens gravadas há mais de N dias (as entregas de webhook já feitas
+continuam no histórico de entregas, só sem o vínculo com a mensagem).
+
+## Webhooks
+
+Cada instância pode ter **até 10 webhooks**, cada um com sua URL, eventos e
+cabeçalhos. A requisição é a mesma do webhook da Evolution API 2.4.0-rc2:
+`POST` com o envelope `{ event, instance, data, destination, date_time,
+sender, server_url, apikey }` e os cabeçalhos `X-Instance-ID`,
+`X-Instance-Name`, `X-Event-Type`, `X-Timestamp`, mais `X-Delivery-ID`
+(extra do WSB) e `User-Agent: WSB-Webhook/1.0`. Contrato completo, com
+exemplos de cada evento:
+[`docs/contracts/webhook-payload.md`](docs/contracts/webhook-payload.md).
+
+```bash
+curl -X POST -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  http://localhost:3000/sessions/5511999999999/webhooks \
+  -d '{"url": "https://texteaseai.example/webhooks/wsb", "events": ["MESSAGES_UPSERT"], "base64": true,
+       "headers": {"Authorization": "Bearer token-do-receptor"}}'
+```
+
+| Campo           | Default               | O que faz |
+|-----------------|-----------------------|-----------|
+| `url`           | obrigatório           | `http`/`https`, até 2048 caracteres. |
+| `enabled`       | `true`                | Desativado não recebe eventos novos, e as entregas pendentes ficam pausadas até reativar. |
+| `events`        | `["MESSAGES_UPSERT"]` | Subconjunto dos 7 eventos (tabela abaixo). |
+| `base64`        | `false`               | Embute a mídia em `data.message.base64`. |
+| `byEvents`      | `false`               | Acrescenta o evento ao path: `<url>/messages-upsert`. |
+| `includeFromMe` | `false`               | `messages.upsert` também para mensagens enviadas pelo próprio número em outro aparelho. |
+| `headers`       | `{}`                  | Até 20 cabeçalhos extras. O nome especial `jwt_key` não é repassado: vira `Authorization: Bearer <JWT HS256>` assinado com ele (como na Evolution). |
+
+Na leitura (`GET`), os valores dos cabeçalhos voltam como `"••••"`. No `PUT`
+(substituição completa), mandar `"••••"` mantém o valor salvo — **só se o
+destino (esquema + host + porta) não mudar**. Trocou o host e mandou a
+máscara, a resposta é `400` pedindo os valores de novo (senão bastaria
+apontar a URL para outro servidor para receber o token salvo). A URL não pode ter usuário/senha
+(autentique por `headers`). Cada valor de cabeçalho vai até 8192 caracteres
+ASCII/Latin-1, e `Host`, `Content-Length`, `Transfer-Encoding` e `Connection`
+não podem ser personalizados; os cabeçalhos fixos (`X-Delivery-ID`,
+`User-Agent` etc.) não são sobrescritos.
+
+### Eventos
+
+| Evento (config)     | `event`             | Quando dispara | `data` |
+|---------------------|---------------------|----------------|--------|
+| `MESSAGES_UPSERT`   | `messages.upsert`   | Mensagem nova recebida (e, com `includeFromMe`, enviada pelo celular). **Nunca** para mensagens enviadas pela API. | Mensagem no formato da Evolution (ver "Mensagens recebidas"). |
+| `SEND_MESSAGE`      | `send.message`      | Mensagem enviada por esta API (`/messages`, `sendList`, `sendButtons`). | Mesmo formato do `messages.upsert`, `key.fromMe: true`. |
+| `MESSAGES_UPDATE`   | `messages.update`   | Mudança de status de uma mensagem gravada (entregue, lida, reproduzida, erro). Só avança: `READ` não volta para `DELIVERY_ACK`. | `{ messageId, keyId, remoteJid, fromMe, participant, status, instanceId }`. |
+| `MESSAGES_EDITED`   | `messages.edited`   | Mensagem editada. | `{ key, type: "MESSAGE_EDIT", editedMessage }`. |
+| `MESSAGES_DELETE`   | `messages.delete`   | Mensagem apagada para todos. | `{ remoteJid, fromMe, id }` da mensagem apagada. |
+| `CONNECTION_UPDATE` | `connection.update` | Instância conectando, conectada ou desconectada. | `{ instance, wuid, profileName, state: "open" \| "connecting" \| "close", statusReason }`. |
+| `QRCODE_UPDATED`    | `qrcode.updated`    | QR code novo para parear. | `{ qrcode: { instance, pairingCode, code, base64 } }`. |
+
+### Entrega, retentativa e deduplicação
+
+- **Durável:** cada aviso é gravado numa fila no Postgres
+  (`wa_webhook_deliveries`) na mesma transação da mensagem, e sai em
+  seguida. Um restart da bridge não perde avisos: o que estava pendente sai
+  quando ela volta.
+- **Qualquer `2xx` conta como entregue.** `400`, `401`, `403`, `404`, `422`
+  e redirects (`3xx`, que não são seguidos) são falha definitiva, sem
+  retentativa (configuração errada do lado do receptor). `qrcode.updated`
+  tem uma tentativa só: o QR expira em segundos. Timeout, erro de rede, `408`, `429` e `5xx` são retentados com
+  backoff exponencial (5s, 10s, 20s… até 5 min, ±20% de variação). Com os
+  defaults, são 15 tentativas em **~45 minutos**. Depois disso, a entrega
+  fica `failed`.
+- **At-least-once:** em casos raros (restart no meio de um envio, receptor
+  que responde depois do timeout) o mesmo aviso pode chegar mais de uma vez.
+  Deduplique por `data.key.id` + `instance`, ou por `X-Delivery-ID` (estável
+  entre retentativas).
+- A ordem é a de chegada "na medida do possível": com concorrência e
+  retentativas, um aviso pode passar à frente de outro.
+- O histórico de entregas (`GET .../deliveries`) mostra situação,
+  tentativas, último código e último erro. Entregas concluídas — e as
+  pendentes de webhooks desativados há muito tempo — são apagadas depois de
+  `WEBHOOK_DELIVERY_RETENTION_DAYS` dias.
+- **Concorrência:** até `WEBHOOK_CONCURRENCY` POSTs ao mesmo tempo no total e
+  no máximo `WEBHOOK_CONCURRENCY_PER_WEBHOOK` por webhook, para que um
+  receptor lento (ou fora do ar, esperando timeout) não atrase os webhooks das
+  outras instâncias. O limite por webhook vale por processo.
+- `POST .../test` envia `event: "webhook.test"` na hora, sem fila nem
+  retentativa, e responde `200` com `{ ok, statusCode, durationMs, error? }`.
+
+### Mídia
+
+Com `base64: true`, imagem, vídeo, vídeo-nota, áudio, documento e sticker
+chegam com o arquivo inteiro em `data.message.base64`. O arquivo é baixado
+do WhatsApp **na hora do envio** e não fica guardado em disco nem no banco.
+Se passar de `WEBHOOK_MEDIA_MAX_BYTES` ou o download falhar (expirado,
+timeout de `WEBHOOK_MEDIA_TIMEOUT_MS`), o aviso sai mesmo assim, sem o
+arquivo e com `data.message.base64Error: "too_large" | "download_failed"`.
+
+O arquivo também pode ser pedido depois, como na Evolution:
+
+```bash
+curl -X POST -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  http://localhost:3000/sessions/5511999999999/chat/getBase64FromMediaMessage \
+  -d '{"message": {"key": {"id": "3EB0A1B2C3D4E5F60718"}}}'
+# { "mediaType": "imageMessage", "fileName": "...jpeg", "caption", "size", "mimetype", "base64" }
+```
+
+Aceita só a `key.id` (busca a mensagem gravada) ou a mensagem inteira no
+formato da Evolution. `convertToMp4` é aceito e ignorado (não há ffmpeg na
+imagem). Erros: `404` (mensagem não encontrada), `400` (não é mídia), `409`
+(sessão não conectada: o socket é necessário para pedir o reenvio de mídia
+expirada), `413` (acima de `WEBHOOK_MEDIA_MAX_BYTES`) e `502` (o WhatsApp
+não devolveu a mídia).
+
+### Diferenças em relação à Evolution
+
+1. Campos binários (`mediaKey`, `jpegThumbnail`, `fileSha256` etc.) saem como
+   string base64, e números `Long` (`fileLength`, `mediaKeyTimestamp`) como
+   número. A Evolution manda os binários como objeto indexado
+   (`{"0":12,"1":34,...}`).
+2. `apikey` é sempre `null`: a bridge nunca envia a API key global a terceiros.
+3. `data.message.base64Error` é um campo extra.
+4. LID: a mesma troca da Evolution (`remoteJid` = número, `remoteJidAlt` =
+   LID), mas em mensagens `fromMe` um alt que aponte para o próprio número é
+   descartado (a Evolution gravaria a conversa com o número da instância), e
+   o número também é buscado no mapeamento do Baileys. Sem número conhecido,
+   chega `@lid` com `addressingMode: "lid"`.
+5. `messages.upsert` não inclui por padrão as mensagens enviadas pelo próprio
+   número (só com `includeFromMe`) e **nunca** inclui as enviadas pela API, que
+   saem só como `send.message`. Isso evita eco e loop com o Chatwoot.
+
+Além disso, `contextInfo` vem `null` quando não há citação (na Evolution o
+campo some do JSON).
+
+### Segurança
+
+- As rotas de webhook exigem a API key, como todas as outras.
+- Os cabeçalhos dos webhooks (tokens do receptor) nunca voltam na leitura e
+  nunca vão para o log. O log também omite a query string e as credenciais
+  da URL.
+- **SSRF consciente:** a bridge faz `POST` para a URL cadastrada, que pode
+  ser um endereço da rede interna (é o caso comum: texteaseai no mesmo
+  Docker). Quem tem a API key consegue, portanto, fazer a bridge chamar
+  qualquer endereço `http(s)` alcançável por ela — e o `POST .../test`
+  devolve o código HTTP ou de rede (`ECONNREFUSED` etc.), o que permite
+  sondar a rede interna. É o mesmo risco já documentado para o
+  `thumbnailUrl` dos botões. A validação é só de protocolo (`http`/`https`).
+  Redirects não são seguidos (um `3xx` levaria os cabeçalhos a outro destino).
+- **Mídia só do CDN do WhatsApp:** `url` e `directPath` de uma mensagem
+  recebida vêm de quem mandou a mensagem. A bridge ignora o `url` e só baixa
+  pelo `directPath` validado, em `https://mmg.whatsapp.net` — senão uma
+  mensagem forjada faria a bridge buscar um endereço interno sem precisar da
+  API key. No máximo 3 downloads de mídia rodam ao mesmo tempo.
+- **QR code em webhook:** `qrcode.updated` leva o código de pareamento,
+  que dá acesso à conta enquanto não expira. Só inscreva esse evento em um
+  receptor confiável. O payload fica no histórico de entregas até a limpeza
+  (`WEBHOOK_DELIVERY_RETENTION_DAYS`).
+- **Cabeçalhos cifrados no banco:** os valores dos cabeçalhos (tokens do
+  receptor) são gravados com AES-256-GCM; um dump do banco não os expõe. A
+  chave vem de `WEBHOOK_HEADERS_KEY` ou, sem ela, é derivada da `API_KEY`.
+  Nesse segundo caso, **trocar a `API_KEY` invalida os cabeçalhos salvos**:
+  as entregas desses webhooks passam a falhar com "não foi possível
+  decifrar o cabeçalho..." (nada é enviado sem o token) até os valores serem
+  cadastrados de novo. Para poder trocar a API key livremente, defina
+  `WEBHOOK_HEADERS_KEY` (`openssl rand -hex 32`) e não a troque. As
+  credenciais do Baileys (`wa_auth_state`) continuam em texto: proteja o
+  acesso ao banco.
+- **Corpo das requisições:** só é lido depois da API key, e só as rotas de
+  mídia (`/messages`, `/message/sendButtons`) aceitam até `JSON_BODY_LIMIT`;
+  as demais, até 256kb. JSON inválido ou grande demais responde
+  `400`/`413` no formato `{ "error" }`.
+- A tela `/manager` é servida com CSP restritivo (`script-src 'self'`) e
+  `X-Frame-Options: DENY`.
+
+## Tela de configuração
+
+`http://localhost:3000/manager` abre uma tela (React + shadcn/ui) para
+gerenciar os webhooks sem montar requisições na mão:
+
+- entrar com a **mesma `API_KEY`** da API. A chave fica só no
+  `sessionStorage` da aba: fechou a aba, pede de novo;
+- ver as instâncias com número, nome de perfil e status;
+- ligar ou desligar "ignorar grupos";
+- criar, editar, ativar/desativar, testar e excluir webhooks;
+- acompanhar o histórico de entregas, com filtro por situação.
+
+Os arquivos da tela são públicos (não contêm dado nenhum). Tudo o que ela
+mostra vem das rotas `/sessions`, com a API key.
+
+A imagem Docker já builda a tela (estágio `manager-build` do `Dockerfile`).
+Para desenvolver:
+
+```bash
+cd manager
+npm install
+npm run dev     # http://localhost:5173/manager/ (faz proxy de /sessions para localhost:3000)
+npm run build   # gera manager/dist, servido pela bridge em /manager
+```
+
+Rodando a bridge fora do Docker sem `manager/dist`, a API funciona
+normalmente e o log avisa que a tela está indisponível.
+
+> `npm audit` em `manager/` aponta avisos no Tailwind CSS 3 e nas
+> dependências dele (`braces`, `micromatch`, `chokidar`,
+> `postcss-selector-parser`). São ferramentas de **build**: não vão para o
+> navegador nem para a imagem final, e só seriam exploráveis com padrões de
+> arquivo maliciosos no próprio `tailwind.config.ts`. A correção exige migrar
+> para o Tailwind 4 (que muda a configuração do tema do shadcn), e ficou para
+> uma tarefa própria.
 
 ## Status possíveis de uma sessão
 
@@ -411,6 +707,10 @@ design abaixo).
   em uma réplica por vez (senão as duas brigam pelo mesmo socket do
   WhatsApp). Pra escalar de verdade, seria preciso um lock distribuído (ex:
   `pg_advisory_lock` por `session_id`) decidindo quem "possui" cada sessão.
+- **Fila de webhooks no próprio Postgres** (outbox `wa_webhook_deliveries`,
+  com `FOR UPDATE SKIP LOCKED`), em vez de Redis/RabbitMQ: o Postgres já é
+  dependência, a entrega sobrevive a restart e o histórico fica consultável.
+  A Evolution faz retentativa em memória e perde avisos num restart.
 - **Sem fila de envio** — disparos são síncronos, um por chamada. Se for
   disparar volume, vale enfileirar (ex: BullMQ/Redis) com um intervalo entre
   mensagens pra não levar ban.

@@ -1,0 +1,23 @@
+{
+  "key": {
+    "remoteJid": "5511988887777@s.whatsapp.net",
+    "remoteJidAlt": "123456789012345@lid",
+    "addressingMode": "pn",
+    "fromMe": false,
+    "id": "A017B2C3D4E5F60718293A4B5C6D7E8F"
+  },
+  "messageTimestamp": 1792750000,
+  "pushName": "Maria Exemplo",
+  "broadcast": false,
+  "message": {
+    "buttonsResponseMessage": {
+      "selectedButtonId": "btn-1",
+      "selectedDisplayText": "Sim",
+      "type": 1,
+      "contextInfo": {
+        "stanzaId": "3EB0BUTTONS0000000001",
+        "participant": "5511900000001@s.whatsapp.net"
+      }
+    }
+  }
+}

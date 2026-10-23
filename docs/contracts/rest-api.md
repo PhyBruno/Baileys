@@ -1,0 +1,144 @@
+# Contrato: API REST nova (WSB)
+
+Todas as rotas ficam sob `/sessions` e herdam o middleware existente de `x-api-key` (`401 { "error": "API key ausente ou inválida..." }`). O `:id` é o número da sessão, normalizado com `normalizeNumber`. Erros seguem o padrão atual: `{ "error": "<mensagem em português>" }`. Sessão inexistente em `wa_sessions` → `404`.
+
+Valores sintéticos.
+
+---
+
+## Configurações da instância
+
+### `GET /sessions/:id/settings`
+
+`200 { "groupsIgnore": true }`
+
+### `PATCH /sessions/:id/settings`
+
+Body: `{ "groupsIgnore": false }`. `groupsIgnore` precisa ser booleano, senão `400`.
+`200 { "groupsIgnore": false }`. Vale imediatamente para as próximas mensagens (atualiza o `entry` em memória se a sessão estiver viva).
+
+---
+
+## Webhooks
+
+Representação (`Webhook`):
+
+```json
+{
+  "id": "6f1c2d3e-0000-4000-8000-000000000001",
+  "url": "https://texteaseai.example/webhooks/wsb",
+  "enabled": true,
+  "events": ["MESSAGES_UPSERT"],
+  "base64": true,
+  "byEvents": false,
+  "includeFromMe": false,
+  "headers": { "Authorization": "••••" },
+  "createdAt": "2026-10-23T10:00:00.000Z",
+  "updatedAt": "2026-10-23T10:00:00.000Z",
+  "lastDelivery": { "status": "delivered", "statusCode": 200, "at": "2026-10-23T10:15:30.000Z" }
+}
+```
+
+`headers` vem sempre mascarado na leitura. `lastDelivery` é `null` se nunca houve entrega.
+
+### `GET /sessions/:id/webhooks`
+
+`200 Webhook[]`
+
+### `POST /sessions/:id/webhooks`
+
+Body (só `url` é obrigatório):
+
+```json
+{ "url": "https://...", "enabled": true, "events": ["MESSAGES_UPSERT"], "base64": false,
+  "byEvents": false, "includeFromMe": false, "headers": { "Authorization": "Bearer xyz" } }
+```
+
+Validação, com `400` e mensagem específica em cada caso:
+
+- `url` precisa ser URL válida com protocolo `http:`/`https:` e no máximo 2048 chars.
+- `events` precisa ser array de valores conhecidos (lista em webhook-payload.md); vazio ou ausente vira `["MESSAGES_UPSERT"]`.
+- `url` não pode ter usuário/senha (credencial vai em `headers`).
+- `headers` precisa ser um objeto plano `string → string`, com no máximo 20 chaves e nomes de header válidos (até 256 caracteres). Os valores vão até 8192 caracteres, só ASCII/Latin-1. `Host`, `Content-Length`, `Transfer-Encoding` e `Connection` são recusados.
+- Booleanos precisam ser booleanos.
+- Limite de 10 webhooks por instância.
+
+`201 Webhook`
+
+### `PUT /sessions/:id/webhooks/:webhookId`
+
+Body: mesmo formato, substituição completa. Valor de header igual a `"••••"` mantém o valor salvo, desde que a origem da URL (esquema + host + porta) não mude. Se mudar e algum header vier com a máscara, a resposta é `400` pedindo o valor de novo.
+`200 Webhook` · `404` se o webhook não existir ou não pertencer à sessão.
+
+### `DELETE /sessions/:id/webhooks/:webhookId`
+
+`200 { "id": "...", "status": "removed" }`. As entregas pendentes são descartadas (CASCADE). `404` se não existir.
+
+### `POST /sessions/:id/webhooks/:webhookId/test`
+
+Envia o evento `webhook.test` na hora, sem outbox, com o mesmo timeout.
+`200 { "ok": true, "statusCode": 200, "durationMs": 184 }` ou `200 { "ok": false, "statusCode": 500, "durationMs": 95, "error": "HTTP 500" }` / `{ "ok": false, "statusCode": null, "error": "timeout após 10000ms" }`.
+A resposta é sempre `200` quando o teste rodou: o resultado do destino vai no corpo.
+
+### `GET /sessions/:id/webhooks/:webhookId/deliveries?status=&limit=50&before=`
+
+- `status` opcional: `pending|delivering|delivered|failed`
+- `limit`: 1–200, padrão 50
+- `before`: id de paginação
+
+`200`:
+
+```json
+{ "items": [ { "id": 4821, "event": "MESSAGES_UPSERT", "status": "failed", "attempts": 10,
+  "lastStatusCode": 503, "lastError": "HTTP 503", "nextAttemptAt": null,
+  "createdAt": "...", "deliveredAt": null, "messageKeyId": "3EB0A1B2C3D4E5F60718" } ],
+  "nextBefore": 4790 }
+```
+
+O payload não é devolvido aqui, para manter a resposta leve.
+
+---
+
+## Mensagens
+
+### `GET /sessions/:id/messages?remoteJid=&limit=50&before=`
+
+Histórico gravado, do mais novo para o mais antigo. `remoteJid` é opcional (dígitos ou JID). `limit` vai de 1 a 200.
+`200 { "items": [ <data no formato de messages.upsert> + "origin" ], "nextBefore": <id|null> }`
+
+### `POST /sessions/:id/chat/getBase64FromMediaMessage`
+
+Compatível com a rota homônima da Evolution (`/chat/getBase64FromMediaMessage/:instance`).
+
+Body: `{ "message": { "key": { "id": "3EB0A1B2C3D4E5F60718" } }, "convertToMp4": false }`. Também aceita a mensagem inteira (`message.message`), no formato da Evolution, com `mediaKey` em base64 ou como objeto indexado. `convertToMp4` é aceito e ignorado: não há ffmpeg na imagem.
+
+`200`:
+
+```json
+{ "mediaType": "imageMessage", "fileName": "3EB0A1B2C3D4E5F60718.jpeg", "caption": "foto",
+  "size": { "fileLength": 48213, "height": 1280, "width": 720 }, "mimetype": "image/jpeg",
+  "base64": "<b64>" }
+```
+
+Erros:
+
+- `404`: mensagem não encontrada nesta sessão
+- `400`: a mensagem não é de mídia
+- `409`: sessão não conectada (precisa do socket para reupload)
+- `413`: mídia acima de `WEBHOOK_MEDIA_MAX_BYTES` (acrescentado na implementação, para não carregar arquivos arbitrariamente grandes em memória)
+- `502`: o WhatsApp não devolveu a mídia (expirada/indisponível ou timeout)
+
+---
+
+## Manager (estáticos)
+
+`GET /manager` e qualquer subcaminho servem a SPA, **sem** API key. Os arquivos não contêm dados, e toda chamada da SPA usa as rotas acima com `x-api-key`. `GET /manager` → `index.html`, com fallback de SPA para rotas desconhecidas sob `/manager`. No Express 5 o fallback é declarado como `/manager/{*splat}`, porque `'/manager/*'` é inválido.
+
+## Mudanças em rotas existentes
+
+- `POST /sessions/:id/messages`, `/message/sendList` e `/message/sendButtons`:
+  - Geram o id da mensagem antes de enviar e o registram como "enviado pela API" (research R4).
+  - Depois do envio, gravam em `wa_messages` com `origin = 'api'` e enfileiram `SEND_MESSAGE`.
+  - O formato da resposta HTTP não muda. A espera de status começa **antes** da gravação, que roda em paralelo a ela, então a gravação não atrasa a resposta nem faz perder confirmações (SC-007).
+- `DELETE /sessions/:id`: sem mudança de código. O CASCADE remove mensagens, webhooks e entregas.
+- `GET /sessions`: sem mudança (a tela usa o retorno atual).

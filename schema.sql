@@ -23,3 +23,89 @@ CREATE TABLE IF NOT EXISTS wa_auth_state (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (session_id, key)
 );
+
+-- "Ignorar grupos" por instância (mesmo papel do Setting.groupsIgnore da
+-- Evolution). Ligado por padrão: a maioria das integrações de atendimento só
+-- quer conversa individual. Mesmo padrão de upgrade da coluna "name" acima.
+ALTER TABLE wa_sessions ADD COLUMN IF NOT EXISTS groups_ignore BOOLEAN NOT NULL DEFAULT true;
+
+-- Mensagens recebidas e enviadas, já normalizadas no formato "data" da
+-- Evolution (key/message/context_info em JSON, binários em base64), pra que o
+-- payload do webhook saia direto da linha.
+CREATE TABLE IF NOT EXISTS wa_messages (
+  id                BIGSERIAL PRIMARY KEY,
+  session_id        TEXT NOT NULL REFERENCES wa_sessions(id) ON DELETE CASCADE,
+  key_id            TEXT NOT NULL,           -- key.id da mensagem
+  remote_jid        TEXT NOT NULL,           -- conversa, já normalizada (PN preferido ao LID)
+  remote_jid_alt    TEXT,                    -- LID quando houve troca pra PN
+  participant       TEXT,                    -- autor, em grupo
+  from_me           BOOLEAN NOT NULL,
+  origin            TEXT NOT NULL,           -- 'inbound' (de terceiros) | 'device' (próprio número, outro aparelho) | 'api' (enviada por esta bridge)
+  push_name         TEXT,
+  message_type      TEXT NOT NULL,           -- ex: conversation, imageMessage, listResponseMessage
+  key               JSONB NOT NULL,
+  message           JSONB NOT NULL,
+  context_info      JSONB,
+  message_timestamp BIGINT NOT NULL,         -- segundos epoch
+  status            TEXT,                    -- ERROR | PENDING | SERVER_ACK | DELIVERY_ACK | READ | PLAYED | EDITED | DELETED
+  source            TEXT,                    -- android | ios | web | desktop | unknown
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Deduplicação: o Baileys reentrega mensagens após reconexão, e o eco de uma
+  -- mensagem enviada pela API pode chegar antes ou depois da gravação da rota.
+  -- O INSERT usa ON CONFLICT DO NOTHING; sem linha nova, não há aviso de webhook.
+  CONSTRAINT wa_messages_session_key_uniq UNIQUE (session_id, key_id, from_me)
+);
+
+CREATE INDEX IF NOT EXISTS wa_messages_conversation_idx
+  ON wa_messages (session_id, remote_jid, message_timestamp DESC);
+
+-- GET /messages sem filtro de conversa (paginado por id) e a limpeza por
+-- idade (MESSAGE_RETENTION_DAYS) não usam o índice de conversa acima.
+CREATE INDEX IF NOT EXISTS wa_messages_session_id_idx ON wa_messages (session_id, id DESC);
+CREATE INDEX IF NOT EXISTS wa_messages_created_at_idx ON wa_messages (created_at);
+
+-- Webhooks cadastrados por instância (N por sessão; a Evolution só permite 1).
+CREATE TABLE IF NOT EXISTS wa_webhooks (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id      TEXT NOT NULL REFERENCES wa_sessions(id) ON DELETE CASCADE,
+  url             TEXT NOT NULL,
+  enabled         BOOLEAN NOT NULL DEFAULT true,
+  events          TEXT[] NOT NULL DEFAULT '{MESSAGES_UPSERT}',
+  base64          BOOLEAN NOT NULL DEFAULT false,  -- embutir mídia (webhookBase64 da Evolution)
+  by_events       BOOLEAN NOT NULL DEFAULT false,  -- sufixo /<evento-kebab> na URL (webhookByEvents)
+  include_from_me BOOLEAN NOT NULL DEFAULT false,  -- messages.upsert também pra mensagens do próprio número em outro aparelho
+  headers         JSONB NOT NULL DEFAULT '{}',     -- cabeçalhos extras; "jwt_key" vira Authorization: Bearer <jwt>
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS wa_webhooks_session_idx ON wa_webhooks (session_id);
+
+-- Outbox de entregas de webhook. A linha nasce na MESMA transação que grava a
+-- mensagem, então um aviso nunca se perde num restart entre gravar e enviar.
+-- O envelope (date_time, destination...) é montado na hora do envio; aqui só
+-- fica o "data", sem base64 (a mídia é baixada sob demanda no envio).
+CREATE TABLE IF NOT EXISTS wa_webhook_deliveries (
+  id               BIGSERIAL PRIMARY KEY,   -- também vai no header X-Delivery-ID
+  webhook_id       UUID NOT NULL REFERENCES wa_webhooks(id) ON DELETE CASCADE,
+  session_id       TEXT NOT NULL,
+  event            TEXT NOT NULL,           -- nome de configuração, ex: MESSAGES_UPSERT
+  message_id       BIGINT REFERENCES wa_messages(id) ON DELETE SET NULL,
+  payload          JSONB NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'pending',  -- pending | delivering | delivered | failed
+  attempts         INT NOT NULL DEFAULT 0,
+  next_attempt_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  locked_until     TIMESTAMPTZ,             -- lease enquanto "delivering"; vencido = elegível de novo (crash no meio do envio)
+  last_status_code INT,
+  last_error       TEXT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  delivered_at     TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS wa_webhook_deliveries_claim_idx
+  ON wa_webhook_deliveries (status, next_attempt_at)
+  WHERE status IN ('pending', 'delivering');
+
+CREATE INDEX IF NOT EXISTS wa_webhook_deliveries_webhook_idx
+  ON wa_webhook_deliveries (webhook_id, id DESC);

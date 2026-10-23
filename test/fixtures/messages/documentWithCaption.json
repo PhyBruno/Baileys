@@ -1,0 +1,44 @@
+{
+  "key": {
+    "remoteJid": "5511988887777@s.whatsapp.net",
+    "remoteJidAlt": "123456789012345@lid",
+    "addressingMode": "pn",
+    "fromMe": false,
+    "id": "A008B2C3D4E5F60718293A4B5C6D7E8F"
+  },
+  "messageTimestamp": 1792750000,
+  "pushName": "Maria Exemplo",
+  "broadcast": false,
+  "message": {
+    "documentWithCaptionMessage": {
+      "message": {
+        "documentMessage": {
+          "url": "https://mmg.whatsapp.net/v/t62.7118-24/00060_n.enc?ccb=11-4",
+          "fileSha256": {
+            "type": "Buffer",
+            "data": "PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw="
+          },
+          "fileEncSha256": {
+            "type": "Buffer",
+            "data": "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0="
+          },
+          "mediaKey": {
+            "type": "Buffer",
+            "data": "Pj4+Pj4+Pj4+Pj4+Pj4+Pj4+Pj4+Pj4+Pj4+Pj4+Pj4="
+          },
+          "directPath": "/v/t62.7118-24/00060_n.enc?ccb=11-4",
+          "mediaKeyTimestamp": {
+            "low": 1792749990,
+            "high": 0,
+            "unsigned": false
+          },
+          "mimetype": "application/pdf",
+          "title": "contrato",
+          "fileLength": 40960,
+          "fileName": "contrato.pdf",
+          "caption": "segue o contrato"
+        }
+      }
+    }
+  }
+}

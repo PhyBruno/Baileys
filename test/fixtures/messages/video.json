@@ -1,0 +1,45 @@
+{
+  "key": {
+    "remoteJid": "5511988887777@s.whatsapp.net",
+    "remoteJidAlt": "123456789012345@lid",
+    "addressingMode": "pn",
+    "fromMe": false,
+    "id": "A005B2C3D4E5F60718293A4B5C6D7E8F"
+  },
+  "messageTimestamp": 1792750000,
+  "pushName": "Maria Exemplo",
+  "broadcast": false,
+  "message": {
+    "videoMessage": {
+      "url": "https://mmg.whatsapp.net/v/t62.7118-24/00030_n.enc?ccb=11-4",
+      "fileSha256": {
+        "type": "Buffer",
+        "data": "Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4="
+      },
+      "fileEncSha256": {
+        "type": "Buffer",
+        "data": "Hx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8="
+      },
+      "mediaKey": {
+        "type": "Buffer",
+        "data": "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA="
+      },
+      "directPath": "/v/t62.7118-24/00030_n.enc?ccb=11-4",
+      "mediaKeyTimestamp": {
+        "low": 1792749990,
+        "high": 0,
+        "unsigned": false
+      },
+      "mimetype": "video/mp4",
+      "fileLength": 2097152,
+      "seconds": 12,
+      "caption": "vídeo",
+      "height": 640,
+      "width": 360,
+      "jpegThumbnail": {
+        "type": "Buffer",
+        "data": "ISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhIQ=="
+      }
+    }
+  }
+}

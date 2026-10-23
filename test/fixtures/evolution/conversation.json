@@ -1,0 +1,31 @@
+{
+  "event": "messages.upsert",
+  "instance": "loja-exemplo",
+  "data": {
+    "key": {
+      "remoteJid": "5511988887777@s.whatsapp.net",
+      "remoteJidAlt": "123456789012345@lid",
+      "addressingMode": "pn",
+      "fromMe": false,
+      "id": "E028B2C3D4E5F60718293A4B5C6D7E8F"
+    },
+    "pushName": "Maria Exemplo",
+    "status": "DELIVERY_ACK",
+    "message": {
+      "conversation": "Olá, tudo bem?",
+      "messageContextInfo": {
+        "deviceListMetadataVersion": 2,
+        "messageSecret": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+      }
+    },
+    "messageType": "conversation",
+    "messageTimestamp": 1792750000,
+    "instanceId": "00000000-0000-4000-8000-00000000BBBB",
+    "source": "android"
+  },
+  "destination": "https://texteaseai.example/webhooks/evolution",
+  "date_time": "2026-10-23T07:15:30.123Z",
+  "sender": "5511900000001@s.whatsapp.net",
+  "server_url": "https://evolution.example",
+  "apikey": "00000000-0000-4000-8000-00000000AAAA"
+}

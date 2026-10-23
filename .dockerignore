@@ -1,7 +1,11 @@
 node_modules
+manager/node_modules
+manager/dist
 npm-debug.log
 .env
 .env.*
+**/.env
+**/.env.*
 !.env.example
 .git
 .gitignore

@@ -80,7 +80,46 @@ Formato do `prepareMessage` da Evolution:
 }
 ```
 
-Em grupo (instância com `groups_ignore = false`), `key.remoteJid` é `<id>@g.us` e `key.participant` traz o autor.
+Em grupo (instância com `groups_ignore = false`), `key.remoteJid` é `<id>@g.us`, `key.participant` traz o autor e `groupSubject` traz o nome do grupo (campo extra do WSB, ver abaixo):
+
+```json
+{
+  "key": {
+    "remoteJid": "120363000000000000@g.us",
+    "participant": "5511988887777@s.whatsapp.net",
+    "participantAlt": "123456789012345@lid",
+    "addressingMode": "pn",
+    "fromMe": false,
+    "id": "3EB0A1B2C3D4E5F60719"
+  },
+  "pushName": "Maria Exemplo",
+  "status": "DELIVERY_ACK",
+  "message": { "conversation": "@5511977776666 @444444444444444 vejam isto" },
+  "contextInfo": {
+    "stanzaId": "3EB0A1B2C3D4E5F60700",
+    "participant": "5511966665555@s.whatsapp.net",
+    "participantAlt": "555555555555555@lid",
+    "quotedMessage": { "conversation": "Mensagem original" },
+    "mentionedJid": ["5511977776666@s.whatsapp.net", "5511955554444@s.whatsapp.net"],
+    "mentionedJidAlt": [null, "444444444444444@lid"]
+  },
+  "messageType": "conversation",
+  "messageTimestamp": 1792750000,
+  "instanceId": "5511900000001",
+  "source": "android",
+  "groupSubject": "Equipe Exemplo"
+}
+```
+
+(No exemplo, a primeira menção já veio como telefone e a segunda veio como LID e foi trocada; a citação era de um LID com telefone conhecido.)
+
+### Campos extras do WSB em mensagem de grupo (não existem na Evolution API)
+
+- **`groupSubject`** (`string | null`): nome do grupo. Só em `messages.upsert` e `send.message` cujo `key.remoteJid` é de grupo (`@g.us`); mensagem individual **não** tem o campo. É resolvido **no envio** do aviso (não é gravado no outbox): memória → tabela `wa_groups` → consulta ao WhatsApp, com espera limitada a `GROUP_METADATA_TIMEOUT_MS`. Vem `null` quando o nome não está disponível (consulta falhou, demorou ou a sessão está desconectada e o grupo nunca foi visto); a entrega segue normalmente. Uma retentativa recalcula o nome (normalmente da memória ou do banco). Por ser resolvido no envio, reflete o nome do grupo no momento da entrega.
+- **`contextInfo.participantAlt`** (`string`): quando o autor da mensagem citada (`contextInfo.participant`) chega como LID e o telefone dele é conhecido, `participant` passa a ser o telefone (`...@s.whatsapp.net`) e o LID original vai para `participantAlt` (mesma convenção de `key.participant`/`key.participantAlt`). Sem telefone conhecido, `participant` fica como veio e `participantAlt` não existe. Citação de mensagem do próprio número da instância fica como está.
+- **`contextInfo.mentionedJidAlt[]`** (`(string | null)[]`): paralelo a `contextInfo.mentionedJid[]`, mesmo tamanho e ordem. Cada LID mencionado com telefone conhecido é trocado pelo telefone em `mentionedJid`, e o LID original fica na mesma posição de `mentionedJidAlt`; as posições não trocadas têm `null`. Se nenhuma posição foi trocada, `mentionedJidAlt` não existe.
+
+A troca de `contextInfo` vale para mensagem de grupo e individual, acontece ao gravar a mensagem e sai igual no webhook e no histórico. Mensagens gravadas antes desta versão ficam como estavam (sem backfill). O JID de dentro de `contextInfo.quotedMessage` e de `reactionMessage.key` não é trocado. Receptor que não conhece esses campos pode ignorá-los: nenhum campo existente mudou de formato.
 
 ### Exemplos de `message` / `messageType` por tipo
 
@@ -112,8 +151,8 @@ Em grupo (instância com `groups_ignore = false`), `key.remoteJid` é `<id>@g.us
 
 1. Campos binários (`mediaKey`, `fileSha256`, `fileEncSha256`, `jpegThumbnail`, `messageSecret` etc.) saem como **string base64**. A Evolution os serializa como objeto indexado (`{"0":12,"1":34}`). Pelo mesmo motivo, números `Long` do protobuf (`fileLength`, `mediaKeyTimestamp`) saem como número. Além disso, `contextInfo` vem `null` quando não existe, enquanto na Evolution o campo some do JSON.
 2. `apikey` é sempre `null`.
-3. `message.base64Error` é um campo extra do WSB.
-4. Endereçamento LID: mesma troca da Evolution (`remoteJid` = PN, `remoteJidAlt` = LID, `addressingMode: "pn"`), mas em mensagens `fromMe` um alt que aponte para o próprio número é descartado (a Evolution trocaria pelo número da instância), e o PN também é buscado no mapeamento LID→PN do Baileys quando não vem na mensagem. Sem PN conhecido, chega `remoteJid: "...@lid"` com `addressingMode: "lid"`. Em grupo, a regra vale para `participant`/`participantAlt`. Ver research R2.1.
+3. `message.base64Error`, `groupSubject`, `contextInfo.participantAlt` e `contextInfo.mentionedJidAlt[]` são campos extras do WSB (ver "Campos extras do WSB em mensagem de grupo").
+4. Endereçamento LID: mesma troca da Evolution (`remoteJid` = PN, `remoteJidAlt` = LID, `addressingMode: "pn"`), mas em mensagens `fromMe` um alt que aponte para o próprio número é descartado (a Evolution trocaria pelo número da instância), e o PN também é buscado no mapeamento LID→PN do Baileys quando não vem na mensagem. Sem PN conhecido, chega `remoteJid: "...@lid"` com `addressingMode: "lid"`. Em grupo, a regra vale para `participant`/`participantAlt`. A mesma troca vale para `contextInfo.participant` (citação) e `contextInfo.mentionedJid[]` (menções), que a Evolution entrega como o WhatsApp enviou. Ver research R2.1.
 5. `messages.upsert` não inclui por padrão mensagens enviadas pelo próprio número (só com `includeFromMe`), e **nunca** inclui as enviadas pela API do WSB, que saem só como `send.message`. Isso evita eco/loop em integrações como Chatwoot.
 
 ## `data` dos demais eventos (formato da Evolution)

@@ -70,6 +70,11 @@ WEBHOOK_MEDIA_CACHE_MAX_BYTES=104857600 # teto do cache de mídia em memória (1
 WEBHOOK_DELIVERY_RETENTION_DAYS=7       # histórico de entregas concluídas
 WEBHOOK_HEADERS_KEY=                    # chave da cifra dos cabeçalhos dos webhooks no banco (vazio = derivada da API_KEY)
 MESSAGE_RETENTION_DAYS=0                # apaga mensagens de wa_messages com mais de N dias (0 = guarda pra sempre)
+GROUP_METADATA_TTL_MS=21600000          # quanto tempo o nome do grupo fica em memória antes de reler wa_groups (6h)
+GROUP_METADATA_FAILURE_TTL_MS=300000    # grupo cuja consulta ao WhatsApp falhou não é consultado de novo por 5 min
+GROUP_METADATA_TIMEOUT_MS=3000          # espera máxima da consulta do nome ao WhatsApp (depois disso, groupSubject null)
+GROUP_METADATA_HISTORY_MAX_LOOKUPS=10   # consultas ao WhatsApp por requisição do histórico
+GROUP_METADATA_HISTORY_BUDGET_MS=5000   # tempo total que o histórico espera pelos nomes dos grupos
 ```
 
 ### 3. Instalar e rodar
@@ -433,7 +438,21 @@ resposta enviada pelo Chatwoot (via API) de voltar como mensagem nova.
 mensagem ou o mapeamento LID→número que o próprio Baileys guarda. Se o
 número for desconhecido, a mensagem segue com `remoteJid: "...@lid"` e
 `addressingMode: "lid"`: quem consome precisa aceitar esse caso. Em grupo, a
-mesma regra vale para `key.participant`.
+mesma regra vale para `key.participant`. Vale também para quem foi citado
+(`contextInfo.participant`, com o LID em `contextInfo.participantAlt`) e para
+quem foi mencionado (`contextInfo.mentionedJid[]`, com os LIDs trocados no
+vetor paralelo `contextInfo.mentionedJidAlt[]`, `null` nas posições não
+trocadas). Campos extras do WSB; mensagens gravadas antes ficam como estavam.
+
+**Nome do grupo** — mensagem de grupo sai no webhook (`messages.upsert` e
+`send.message`) e no histórico com `groupSubject` (`string | null`); mensagem
+individual não tem o campo. O nome é resolvido na hora (memória → tabela
+`wa_groups` → consulta ao WhatsApp) e nunca gravado em `wa_messages` nem no
+outbox, então o histórico mostra o nome **atual** do grupo. `wa_groups` é
+alimentada pelos eventos de grupo do Baileys (entrar, renomear) e pelas
+consultas, e é o que mantém os nomes com a sessão desconectada. Consulta que
+falha ou demora vira `null` sem atrasar a entrega além de
+`GROUP_METADATA_TIMEOUT_MS`. Os logs mostram só o JID do grupo, nunca o nome.
 
 **Ignorar grupos** — por instância, **ligado por padrão**. Com ele ligado,
 mensagens de grupo não são gravadas nem repassadas. Vale na hora para as
@@ -451,7 +470,11 @@ curl -X PATCH -H "x-api-key: $KEY" -H "Content-Type: application/json" \
 devolve as mensagens gravadas, da mais nova para a mais antiga
 (`{ "items": [<data> + "origin"], "nextBefore": <id|null> }`). `remoteJid`
 aceita só dígitos ou um JID; `limit` vai de 1 a 200; para a próxima página,
-passe o `nextBefore` recebido em `before`. Por padrão o histórico não
+passe o `nextBefore` recebido em `before`. Itens de grupo trazem
+`groupSubject` (nome **atual** do grupo, ver acima): cada grupo da página é
+resolvido uma vez, com no máximo `GROUP_METADATA_HISTORY_MAX_LOOKUPS`
+consultas ao WhatsApp e `GROUP_METADATA_HISTORY_BUDGET_MS` de espera por
+requisição; o que passar disso sai `null` e a resposta continua `200`. Por padrão o histórico não
 expira; com `MESSAGE_RETENTION_DAYS=N`, uma limpeza horária apaga as
 mensagens gravadas há mais de N dias (as entregas de webhook já feitas
 continuam no histórico de entregas, só sem o vínculo com a mensagem).
@@ -568,7 +591,9 @@ não devolveu a mídia).
    número. A Evolution manda os binários como objeto indexado
    (`{"0":12,"1":34,...}`).
 2. `apikey` é sempre `null`: a bridge nunca envia a API key global a terceiros.
-3. `data.message.base64Error` é um campo extra.
+3. `data.message.base64Error`, `data.groupSubject`,
+   `data.contextInfo.participantAlt` e `data.contextInfo.mentionedJidAlt[]`
+   são campos extras (não existem na Evolution).
 4. LID: a mesma troca da Evolution (`remoteJid` = número, `remoteJidAlt` =
    LID), mas em mensagens `fromMe` um alt que aponte para o próprio número é
    descartado (a Evolution gravaria a conversa com o número da instância), e

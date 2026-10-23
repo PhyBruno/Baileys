@@ -104,7 +104,17 @@ O payload não é devolvido aqui, para manter a resposta leve.
 ### `GET /sessions/:id/messages?remoteJid=&limit=50&before=`
 
 Histórico gravado, do mais novo para o mais antigo. `remoteJid` é opcional (dígitos ou JID). `limit` vai de 1 a 200.
-`200 { "items": [ <data no formato de messages.upsert> + "origin" ], "nextBefore": <id|null> }`
+`200 { "items": [ <data no formato de messages.upsert> + "origin" (+ "groupSubject" em item de grupo) ], "nextBefore": <id|null> }`
+
+Item de grupo (`key.remoteJid` terminando em `@g.us`) traz também **`groupSubject`** (`string | null`), o nome do grupo; item individual não tem o campo. Regras:
+
+- É o nome **atual** do grupo, resolvido na leitura, e não o que ele tinha quando a mensagem foi enviada. O nome não é gravado em `wa_messages` (sem backfill); só o mapeamento JID → nome fica em `wa_groups`.
+- Cada grupo distinto da página é resolvido uma vez (memória → uma consulta a `wa_groups` pra página inteira → consulta ao WhatsApp só pros que faltaram). Com `remoteJid=<grupo>`, é uma resolução só.
+- Consultas ao WhatsApp por requisição: no máximo `GROUP_METADATA_HISTORY_MAX_LOOKUPS` (padrão 10), dentro de um orçamento total de `GROUP_METADATA_HISTORY_BUDGET_MS` (padrão 5000 ms). O que passar do limite, falhar ou demorar sai com `groupSubject: null`, e a resposta continua `200`.
+- Com a sessão desconectada, o nome vem só da memória e de `wa_groups` (grupos já vistos); os demais saem `null`.
+- Paginação (`limit`, `before`, `nextBefore`) e ordem não mudam.
+
+`contextInfo.participantAlt` e `contextInfo.mentionedJidAlt[]` (citação e menções com LID trocado por telefone) seguem as regras de webhook-payload.md e saem iguais aqui, nas mensagens gravadas a partir desta versão.
 
 ### `POST /sessions/:id/chat/getBase64FromMediaMessage`
 

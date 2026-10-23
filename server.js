@@ -18,7 +18,7 @@ import makeWASocket, {
 } from 'baileys'
 import { pool, migrate } from './db.js'
 import { usePostgresAuthState, wipeAuthState } from './postgresAuthState.js'
-import { makePnResolver, normalizeKeyAddressing } from './lid.js'
+import { makePnResolver, normalizeKeyAddressing, normalizeContextInfoAddressing } from './lid.js'
 import {
   shouldProcess,
   prepareMessage,
@@ -321,8 +321,20 @@ async function respondWithMessageStatus(res, messageId, statusPromise) {
 // Normaliza a key do jeito que o listener de messages.upsert faz (LID → PN,
 // sem sufixo de dispositivo), pra que a gravação pela rota e o eco do
 // Baileys caiam na mesma linha de wa_messages.
+function addressingOptions(sock) {
+  return { resolvePn: makePnResolver(sock), ownJids: [sock.user?.id, sock.user?.lid] }
+}
+
 function normalizeKey(sock, key) {
-  return normalizeKeyAddressing(key, { resolvePn: makePnResolver(sock), ownJids: [sock.user?.id, sock.user?.lid] })
+  return normalizeKeyAddressing(key, addressingOptions(sock))
+}
+
+// Mesma troca LID → PN para quem foi citado e mencionado (contextInfo),
+// antes de gravar: o resultado vai pro histórico e pros webhooks.
+async function prepareNormalizedMessage(sock, received, { instanceId, key }) {
+  const data = prepareMessage(received, { instanceId, key })
+  data.contextInfo = await normalizeContextInfoAddressing(data.contextInfo, addressingOptions(sock))
+  return data
 }
 
 // Grava em wa_messages (origin = 'api') uma mensagem que acabou de ser
@@ -332,7 +344,7 @@ function normalizeKey(sock, key) {
 async function recordApiMessage(id, entry, fullMsg) {
   if (!fullMsg?.key?.id || !fullMsg.message) return
   const key = await normalizeKey(entry.sock, fullMsg.key)
-  const data = prepareMessage(fullMsg, { instanceId: id, key })
+  const data = await prepareNormalizedMessage(entry.sock, fullMsg, { instanceId: id, key })
   await saveMessage(id, data, 'api', { onInserted: (client, row) => enqueueMessageEvent(client, id, row) })
 }
 
@@ -370,7 +382,7 @@ async function processIncomingMessage(id, entry, sock, received, upsertType) {
     return
   }
 
-  const data = prepareMessage(received, { instanceId: id, key })
+  const data = await prepareNormalizedMessage(sock, received, { instanceId: id, key })
   const origin = classifyOrigin(key, entry.apiMessageIds)
   await saveMessage(id, data, origin, { onInserted: (client, row) => enqueueMessageEvent(client, id, row) })
 }

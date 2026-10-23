@@ -146,3 +146,53 @@ export async function normalizeKeyAddressing(key, { resolvePn, ownJids = [] } = 
 
   return out
 }
+
+/**
+ * Mesma troca LID → PN para quem foi citado (contextInfo.participant) e
+ * mencionado (contextInfo.mentionedJid[]). Em grupo os dois chegam só como
+ * LID, e o consumidor identifica as pessoas pelo telefone. Campos extras do
+ * WSB, que a Evolution não tem:
+ * - participantAlt: o LID trocado (mesma convenção de key.participantAlt);
+ * - mentionedJidAlt[]: paralelo a mentionedJid, com o LID nas posições
+ *   trocadas e null nas demais. Só existe se alguma posição foi trocada.
+ *
+ * participant igual ao próprio número fica como está (citação de mensagem
+ * nossa). Sem PN conhecido, o endereço fica como veio. Nunca lança e não
+ * altera o objeto recebido. Retorna null se contextInfo for null.
+ */
+export async function normalizeContextInfoAddressing(contextInfo, { resolvePn, ownJids = [] } = {}) {
+  if (!contextInfo || typeof contextInfo !== 'object') return contextInfo ?? null
+  try {
+    const out = { ...contextInfo }
+    const isOwn = (jid) => ownJids.some((own) => own && areJidsSameUser(jid, own))
+
+    const participant = typeof contextInfo.participant === 'string' ? normalizeUser(contextInfo.participant) : undefined
+    if (participant && isLidJid(participant) && !isOwn(participant)) {
+      const pn = await pnFor(participant, undefined, resolvePn)
+      if (pn) {
+        out.participant = pn
+        out.participantAlt = participant
+      }
+    }
+
+    if (Array.isArray(contextInfo.mentionedJid) && contextInfo.mentionedJid.length > 0) {
+      // Em paralelo: uma menção a muitas pessoas não soma a espera de cada lookup.
+      const resolved = await Promise.all(
+        contextInfo.mentionedJid.map(async (jid) => {
+          const lid = typeof jid === 'string' ? normalizeUser(jid) : undefined
+          if (!lid || !isLidJid(lid)) return null
+          const pn = await pnFor(lid, undefined, resolvePn)
+          return pn ? { pn, lid } : null
+        })
+      )
+      if (resolved.some(Boolean)) {
+        out.mentionedJid = contextInfo.mentionedJid.map((jid, i) => resolved[i]?.pn ?? jid)
+        out.mentionedJidAlt = resolved.map((swap) => swap?.lid ?? null)
+      }
+    }
+
+    return out
+  } catch {
+    return contextInfo
+  }
+}

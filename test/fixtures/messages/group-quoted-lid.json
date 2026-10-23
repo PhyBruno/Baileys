@@ -1,0 +1,24 @@
+{
+  "key": {
+    "remoteJid": "120363000000000000@g.us",
+    "participant": "123456789012345@lid",
+    "participantAlt": "5511988887777@s.whatsapp.net",
+    "addressingMode": "lid",
+    "fromMe": false,
+    "id": "A024B2C3D4E5F60718293A4B5C6D7E8F"
+  },
+  "messageTimestamp": 1792750000,
+  "pushName": "Maria Exemplo",
+  "message": {
+    "extendedTextMessage": {
+      "text": "Respondendo a você",
+      "contextInfo": {
+        "stanzaId": "A0019B2C3D4E5F60718293A4B5C6D7E8",
+        "participant": "555555555555555@lid",
+        "quotedMessage": {
+          "conversation": "Mensagem original no grupo"
+        }
+      }
+    }
+  }
+}

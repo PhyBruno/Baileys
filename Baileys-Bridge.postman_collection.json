@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "WhatsApp Bridge API (Baileys + Postgres)",
-    "description": "Collection de exemplo para a bridge Baileys clonada em C:\\repos\\Baileys. Fluxo: connect -> qr -> messages (texto/imagem/video/documento) / message/sendList / message/sendButtons (payload da Evolution API; cabecalho texto ou imagem, corpo, rodape e botoes opcionais) -> configuracoes, mensagens recebidas e webhooks -> disconnect -> connect -> delete. Ajuste as variaveis apiKey/sessionId/toNumber conforme seu ambiente.",
+    "description": "Collection de exemplo para a bridge Baileys clonada em C:\\repos\\Baileys. Fluxo: connect -> qr -> messages (texto/imagem/video/documento/audio, para numero ou grupo) / message/sendList / message/sendButtons (payload da Evolution API; cabecalho texto ou imagem, corpo, rodape e botoes opcionais) -> configuracoes, mensagens recebidas e webhooks -> disconnect -> connect -> delete. Ajuste as variaveis apiKey/sessionId/toNumber conforme seu ambiente.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -9,6 +9,7 @@
     { "key": "apiKey", "value": "troque-por-uma-chave-forte", "type": "string" },
     { "key": "sessionId", "value": "5511999999999", "type": "string" },
     { "key": "toNumber", "value": "5511988887777", "type": "string" },
+    { "key": "groupJid", "value": "120363000000000001@g.us", "type": "string" },
     { "key": "webhookId", "value": "", "type": "string" }
   ],
   "item": [
@@ -141,6 +142,88 @@
         "body": {
           "mode": "raw",
           "raw": "{\n  \"to\": \"{{toNumber}}\",\n  \"type\": \"document\",\n  \"mediaBase64\": \"Q29udGV1ZG8gZGUgZXhlbXBsbyBkbyBkb2N1bWVudG8gZGUgdGVzdGUu\",\n  \"mimetype\": \"text/plain\",\n  \"fileName\": \"exemplo.txt\",\n  \"caption\": \"Documento de teste via Postman\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/messages",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "messages"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Send voice note (audio ptt)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"to\": \"{{toNumber}}\",\n  \"type\": \"audio\",\n  \"mediaBase64\": \"<cole aqui um OGG/Opus em base64 (puro ou data:audio/ogg;base64,...)>\",\n  \"mimetype\": \"audio/ogg; codecs=opus\",\n  \"ptt\": true\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/messages",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "messages"]
+        },
+        "description": "type audio: mimetype obrigatorio. ptt true = mensagem de voz; omitido ou false = arquivo de audio."
+      },
+      "response": []
+    },
+    {
+      "name": "Send audio file",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"to\": \"{{toNumber}}\",\n  \"type\": \"audio\",\n  \"mediaBase64\": \"<cole aqui um MP3 em base64 (puro ou data:audio/mpeg;base64,...)>\",\n  \"mimetype\": \"audio/mpeg\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/messages",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "messages"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Send message to group",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"to\": \"{{groupJid}}\",\n  \"type\": \"text\",\n  \"message\": \"Bom dia, grupo\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/sessions/{{sessionId}}/messages",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions", "{{sessionId}}", "messages"]
+        },
+        "description": "to aceita o JID de grupo (^[0-9]+(-[0-9]+)?@g.us$). 404 se o numero da sessao nao participa do grupo."
+      },
+      "response": []
+    },
+    {
+      "name": "Send voice note to group",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "x-api-key", "value": "{{apiKey}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"to\": \"{{groupJid}}\",\n  \"type\": \"audio\",\n  \"mediaBase64\": \"<cole aqui um OGG/Opus em base64 (puro ou data:audio/ogg;base64,...)>\",\n  \"mimetype\": \"audio/ogg; codecs=opus\",\n  \"ptt\": true\n}"
         },
         "url": {
           "raw": "{{baseUrl}}/sessions/{{sessionId}}/messages",

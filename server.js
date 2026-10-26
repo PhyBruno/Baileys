@@ -41,6 +41,11 @@ import {
   validateButtonsPayload,
   buildButtonsMessage
 } from './interactive.js'
+import { silenceSignalSessionDump } from './signalLogFilter.js'
+
+// Antes de qualquer sessão abrir: a libsignal despeja o SessionEntry (com
+// chaves privadas) no stdout. Ver signalLogFilter.js.
+silenceSignalSessionDump()
 
 const PORT = process.env.PORT || 3000
 const API_KEY = process.env.API_KEY
@@ -917,6 +922,43 @@ function safeCompare(a, b) {
   }
   return crypto.timingSafeEqual(bufA, bufB)
 }
+
+// Auditoria das rotas que mexem no ciclo de vida da sessão (connect, disconnect
+// e DELETE). Os logs de socket ("desconectado (intencional...)") não dizem
+// QUEM pediu; este diz. Fica ANTES da checagem de API key de propósito: uma
+// tentativa recusada com 401 também precisa aparecer.
+//
+// Atrás do Traefik, req.socket.remoteAddress é o IP do próprio proxy. O cliente
+// real vem em x-forwarded-for (cadeia, o Traefik acrescenta o IP que viu) e
+// x-real-ip. Logamos os valores crus, sem "trust proxy": o primeiro item do XFF
+// pode ser forjado pelo cliente se o Traefik não limpar o header (forwardedHeaders
+// .trustedIPs), então o último item é o que o Traefik de fato viu.
+// Os valores vêm do cliente: sanitizados (sem quebra de linha) e truncados pra
+// ninguém forjar linhas de log.
+const LIFECYCLE_ROUTE = /^\/[^/]+\/(connect|disconnect)\/?$/
+const SESSION_ROUTE = /^\/[^/]+\/?$/
+function logValue(value, max = 200) {
+  return JSON.stringify(String(value ?? '-').replace(/[\r\n\t]+/g, ' ').slice(0, max))
+}
+app.use('/sessions', (req, res, next) => {
+  const lifecycle =
+    (req.method === 'POST' && LIFECYCLE_ROUTE.test(req.path)) ||
+    (req.method === 'DELETE' && SESSION_ROUTE.test(req.path))
+  if (!lifecycle) return next()
+
+  const startedAt = Date.now()
+  res.on('close', () => {
+    console.log(
+      `[audit] ${req.method} ${logValue(req.originalUrl)} -> ${res.statusCode}` +
+        `${res.writableFinished ? '' : ' (conexão encerrada antes da resposta)'} ` +
+        `(${Date.now() - startedAt}ms) socket=${req.socket.remoteAddress ?? '-'} ` +
+        `xff=${logValue(req.get('x-forwarded-for'))} xri=${logValue(req.get('x-real-ip'))} ` +
+        `host=${logValue(req.get('x-forwarded-host') ?? req.get('host'))} ` +
+        `origin=${logValue(req.get('origin') ?? req.get('referer'))} ua=${logValue(req.get('user-agent'))}`
+    )
+  })
+  next()
+})
 
 // Todas as rotas de sessão exigem a API key global, enviada no header x-api-key.
 app.use('/sessions', (req, res, next) => {

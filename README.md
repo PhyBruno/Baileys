@@ -28,9 +28,11 @@ normalizado — senão ela recusa com 400.
 
 No `POST /sessions/:id/messages`, o destinatário (`to`) também aceita o JID de
 um grupo de que o número participa (`120363000000000001@g.us` ou o formato
-antigo `5511999999999-1600000000@g.us`) — ver "Enviando para um grupo". Qualquer
-outro JID (`@s.whatsapp.net`, `@lid`, `@newsletter`, `@broadcast`) é recusado
-com 400.
+antigo `5511999999999-1600000000@g.us`) — ver "Enviando para um grupo" — e o
+JID de usuário: `5511999999999@s.whatsapp.net` (resolvido pelo `onWhatsApp()`
+como os dígitos) ou `123456789012345@lid` (enviado direto ao LID, já que o
+`onWhatsApp()` não aceita LID). O sufixo de dispositivo (`:N`) é descartado.
+Os demais JIDs (`@newsletter`, `@broadcast` etc.) são recusados com 400.
 
 Nos endpoints de lista/botões (`/message/sendList` e `/message/sendButtons`),
 o destinatário (`number`) também aceita o JID de usuário, como na Evolution:

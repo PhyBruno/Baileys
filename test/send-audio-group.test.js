@@ -206,16 +206,48 @@ test('(b) metadata sem lista de participantes → 404', async () => {
   assertNothingSent()
 })
 
+// ------------------------------------------------------ (c) JID de usuário
+
+for (const to of ['5511977777777@s.whatsapp.net', '5511977777777:12@s.whatsapp.net', ' 5511977777777@s.whatsapp.net ']) {
+  test(`(c) "to" ${JSON.stringify(to)} resolve pelo onWhatsApp como os dígitos`, async () => {
+    const res = await send({ to, message: 'Olá' })
+    assertCommonFlow(res, PEER)
+    assert.deepEqual(calls.onWhatsApp, ['5511977777777'])
+    assert.equal(calls.groupMetadata.length, 0)
+  })
+}
+
+test('(c) JID @s.whatsapp.net não registrado → 404 sem enviar', async () => {
+  const res = await send({ to: '5511966666666@s.whatsapp.net', message: 'Olá' })
+  assert.equal(res.status, 404)
+  assertNothingSent()
+})
+
+for (const [to, jid] of [
+  ['98765432100000@lid', '98765432100000@lid'],
+  ['98765432100000:3@lid', '98765432100000@lid']
+]) {
+  test(`(c) "to" ${to} vai direto ao LID, sem onWhatsApp`, async () => {
+    const res = await send({ to, type: 'audio', mediaBase64: OGG_DATA_URL, mimetype: 'audio/ogg; codecs=opus', ptt: true })
+    const sent = assertCommonFlow(res, jid)
+    assert.equal(sent.content.ptt, true)
+    assert.equal(calls.onWhatsApp.length + calls.groupMetadata.length, 0)
+  })
+}
+
 // ------------------------------------------------- (c) outros formatos de JID
 
 for (const to of [
-  '98765432100000@lid',
   '120363000000000001@newsletter',
-  '5511977777777@s.whatsapp.net',
   'status@broadcast',
   '120363000000000001@g.us.exemplo',
   'abc@g.us',
-  '120363000000000001-@g.us'
+  '120363000000000001-@g.us',
+  'abc@lid',
+  '98765432100000@lid.exemplo',
+  '98765432100000:@lid',
+  '123@s.whatsapp.net',
+  '5511977777777@c.us'
 ]) {
   test(`(c) "to" ${to} continua 400`, async () => {
     const res = await send({ to, message: 'oi' })

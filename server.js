@@ -41,6 +41,13 @@ import {
   validateButtonsPayload,
   buildButtonsMessage
 } from './interactive.js'
+import {
+  NUMBER_FORMAT,
+  normalizeNumber,
+  parseRecipientNumber,
+  decodeBase64Media,
+  createSendMessageHandler
+} from './outbound.js'
 
 const PORT = process.env.PORT || 3000
 const API_KEY = process.env.API_KEY
@@ -220,10 +227,6 @@ function waitForMessageStatus(sock, messageId, timeoutMs) {
   })
 }
 
-// Formato aceito para o ID da sessão e para o destinatário de mensagens:
-// apenas dígitos, com DDI incluído (ex: 5511999999999). Nada de "+", espaço ou "-".
-const NUMBER_FORMAT = /^\d{8,15}$/
-
 // Quantas mensagens enviadas recentemente ficam guardadas em memória por
 // sessão, pra atender getMessage (pedidos de retry do WhatsApp).
 const MAX_CACHED_MESSAGES_PER_SESSION = 100
@@ -253,28 +256,6 @@ async function resolveBaileysVersion() {
     return
   }
   cachedBaileysVersion = result.version
-}
-
-function normalizeNumber(raw) {
-  return String(raw).replace(/\D/g, '')
-}
-
-// Campo "number" dos endpoints compatíveis com a Evolution: aceita só dígitos
-// com DDI (5511999999999) ou o JID de usuário (5511999999999@s.whatsapp.net,
-// com ou sem sufixo de dispositivo ":N"). Grupo (@g.us), @lid, broadcast etc.
-// ficam de fora de propósito — o fluxo de envio desta bridge é só conversa
-// individual. Sem essa checagem, normalizeNumber() transformaria um JID de
-// grupo em "dígitos" e ele passaria como se fosse um número. Retorna os
-// dígitos ou null.
-function parseRecipientNumber(raw) {
-  if (typeof raw !== 'string') return null
-  let user = raw.trim()
-  if (user.includes('@')) {
-    if (!user.endsWith('@s.whatsapp.net')) return null
-    user = user.slice(0, user.indexOf('@')).replace(/:\d+$/, '')
-  }
-  const digits = normalizeNumber(user)
-  return NUMBER_FORMAT.test(digits) ? digits : null
 }
 
 // Busca a sessão viva deste processo e confirma que ela está conectada. Em
@@ -442,19 +423,6 @@ async function simulateTyping(sock, jid, delayMs) {
     await sock.sendPresenceUpdate('paused', jid)
     remaining -= chunk
   }
-}
-
-// Decodifica uma string base64 (aceita o prefixo opcional de data URL, ex:
-// "data:image/png;base64,...") pro Buffer que o baileys espera em
-// image/video/document. Retorna null se a string não for base64 válido ou vier
-// vazia — o chamador decide como responder (400), em vez desta função
-// lançar exceção pra um caso de erro totalmente esperado (input do cliente).
-function decodeBase64Media(raw) {
-  if (typeof raw !== 'string') return null
-  const commaIdx = raw.indexOf(',')
-  const cleaned = (raw.startsWith('data:') && commaIdx !== -1 ? raw.slice(commaIdx + 1) : raw).replace(/\s+/g, '')
-  if (cleaned.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned)) return null
-  return Buffer.from(cleaned, 'base64')
 }
 
 // Estado em memória das sessões vivas neste processo.
@@ -1054,100 +1022,31 @@ app.delete('/sessions/:id', async (req, res) => {
   res.json({ id, status: 'removed' })
 })
 
-// Endpoint principal: dispara mensagem (texto, imagem, vídeo ou documento) por
-// uma sessão específica. "type" default é "text", pra manter compatibilidade
-// total com o formato antigo { to, message }. Imagem/vídeo/documento vão em
+// Endpoint principal: dispara mensagem (texto, imagem, vídeo, documento ou
+// áudio) por uma sessão específica, a um número ou a um grupo (@g.us). "type"
+// default é "text", pra manter compatibilidade total com o formato antigo
+// { to, message }. Imagem/vídeo/documento/áudio vão em
 // "mediaBase64" — de propósito NÃO existe um "mediaUrl" que o servidor
 // buscaria sozinho: isso seria SSRF (fetch de URL arbitrária vinda de
 // qualquer cliente que tenha a API key global), então mídia só entra
 // embutida no próprio request.
-app.post('/sessions/:id/messages', async (req, res) => {
-  const id = normalizeNumber(req.params.id)
-  const { to, message, type = 'text', mediaBase64, mimetype, fileName, caption } = req.body ?? {}
-
-  if (!to) {
-    return res.status(400).json({ error: 'informe "to" no corpo' })
-  }
-  if (!NUMBER_FORMAT.test(normalizeNumber(to))) {
-    return res.status(400).json({
-      error: 'formato de "to" inválido. Use apenas dígitos com DDI, ex: 5511999999999'
-    })
-  }
-  if (!['text', 'image', 'video', 'document'].includes(type)) {
-    return res.status(400).json({ error: 'campo "type" inválido. Use "text" (default), "image", "video" ou "document".' })
-  }
-
-  let content
-  if (type === 'text') {
-    if (!message) {
-      return res.status(400).json({ error: 'informe "message" no corpo (obrigatório quando "type" é "text")' })
-    }
-    content = { text: message }
-  } else {
-    if (!mediaBase64) {
-      return res.status(400).json({ error: `informe "mediaBase64" no corpo (obrigatório quando "type" é "${type}")` })
-    }
-    const buffer = decodeBase64Media(mediaBase64)
-    if (!buffer || buffer.length === 0) {
-      return res.status(400).json({ error: '"mediaBase64" inválido ou vazio (aceita base64 puro ou data URL "data:<mime>;base64,...")' })
-    }
-
-    if (type === 'document') {
-      // mimetype é obrigatório pro baileys aqui (diferente de "image", que
-      // detecta sozinho se omitido) — ver AnyMediaMessageContent no pacote.
-      if (!mimetype) {
-        return res.status(400).json({ error: 'informe "mimetype" no corpo (obrigatório quando "type" é "document")' })
-      }
-      content = { document: buffer, mimetype, fileName: fileName || 'arquivo', caption: caption || undefined }
-    } else if (type === 'video') {
-      // Também obrigatório aqui: sem mimetype o WhatsApp não sabe tocar o
-      // vídeo no aparelho (o baileys não detecta sozinho como na imagem).
-      if (!mimetype) {
-        return res.status(400).json({ error: 'informe "mimetype" no corpo (obrigatório quando "type" é "video")' })
-      }
-      content = { video: buffer, mimetype, caption: caption || undefined }
-    } else {
-      content = { image: buffer, caption: caption || undefined, ...(mimetype ? { mimetype } : {}) }
-    }
-  }
-
-  const entry = getConnectedEntry(id, res)
-  if (!entry) return
-
-  try {
-    // Não confiamos no formato de dígitos que o cliente mandou pra montar o
-    // JID na mão. Números brasileiros têm o "9" adicional ambíguo (uma conta
-    // pode estar registrada com ou sem ele, dependendo de quando/como foi
-    // cadastrada) — montar "${numero}@s.whatsapp.net" direto manda pra um JID
-    // que pode não existir de verdade. O Baileys não valida isso no envio: ele
-    // aceita, criptografa e devolve um id de mensagem (result.key.id) mesmo
-    // pra um JID fantasma, então "ok: true" sozinho NÃO prova entrega.
-    // onWhatsApp() pergunta pro próprio servidor do WhatsApp qual é o JID
-    // canônico daquele número (é quem realmente sabe resolver o 9), então
-    // usamos o JID que ele devolve em vez do que construímos aqui.
-    const [resolved] = (await entry.sock.onWhatsApp(normalizeNumber(to))) || []
-    if (!resolved?.exists) {
-      return res.status(404).json({ error: `número "${to}" não está registrado no WhatsApp (ou não foi possível confirmar)` })
-    }
-
-    // Id gerado e registrado ANTES do envio: o sendMessage emite o eco
-    // (messages.upsert 'append') num nextTick antes de retornar, e o
-    // listener precisa reconhecer esse eco como 'api' (research R4). O
-    // ...options do Baileys sobrescreve o id que ele geraria sozinho.
-    const messageId = generateMessageIDV2(entry.sock.user.id)
-    entry.apiMessageIds.mark(messageId)
-
-    const result = await entry.sock.sendMessage(resolved.jid, content, { messageId })
-    const statusPromise = waitForMessageStatus(entry.sock, result?.key?.id, MESSAGE_STATUS_TIMEOUT_MS)
-    cacheSentMessage(entry, result?.key?.id, result?.message)
-    recordApiMessage(id, entry, result).catch((err) =>
-      console.error(`[${id}] falha ao gravar mensagem enviada ${result?.key?.id}: ${err.message}`)
-    )
-    await respondWithMessageStatus(res, result?.key?.id, statusPromise)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
+//
+// Validação, conteúdo e envio ficam em outbound.js (testados com socket falso).
+app.post(
+  '/sessions/:id/messages',
+  createSendMessageHandler({
+    getConnectedEntry,
+    generateMessageId: generateMessageIDV2,
+    waitForStatus: (sock, messageId) => waitForMessageStatus(sock, messageId, MESSAGE_STATUS_TIMEOUT_MS),
+    cacheSentMessage,
+    recordApiMessage,
+    respondWithMessageStatus,
+    // Participação no grupo: primeiro a lista em memória que o próprio
+    // Baileys usa no envio (groupMetadata.js, validade curta); sem ela,
+    // sock.groupMetadata. Evita uma consulta ao WhatsApp por mensagem.
+    cachedGroupMetadata: (sessionId, jid) => groups.cachedGroupMetadata(sessionId)(jid)
+  })
+)
 
 // Fluxo comum de /message/sendList e /message/sendButtons. buildContent(sock)
 // monta o proto (já com o payload validado) e retorna { message } ou

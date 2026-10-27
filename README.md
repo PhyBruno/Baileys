@@ -26,6 +26,12 @@ A API normaliza automaticamente o que vier com máscara (`(11) 99999-9999` vira
 `11999999999`), mas o ID da sessão precisa bater com 8 a 15 dígitos depois de
 normalizado — senão ela recusa com 400.
 
+No `POST /sessions/:id/messages`, o destinatário (`to`) também aceita o JID de
+um grupo de que o número participa (`120363000000000001@g.us` ou o formato
+antigo `5511999999999-1600000000@g.us`) — ver "Enviando para um grupo". Qualquer
+outro JID (`@s.whatsapp.net`, `@lid`, `@newsletter`, `@broadcast`) é recusado
+com 400.
+
 Nos endpoints de lista/botões (`/message/sendList` e `/message/sendButtons`),
 o destinatário (`number`) também aceita o JID de usuário, como na Evolution:
 `5511999999999@s.whatsapp.net`. Grupos (`@g.us`) e `@lid` não são suportados.
@@ -144,7 +150,7 @@ Todos abaixo (exceto `/health`) exigem `x-api-key` no header.
 | GET    | `/sessions`                  | Lista todas as sessões (persistidas no banco) e seus status.               |
 | POST   | `/sessions/:id/disconnect`   | Fecha a conexão mas **mantém** as credenciais — reconecta sem novo QR.     |
 | DELETE | `/sessions/:id`              | Logout definitivo: invalida no WhatsApp e apaga as credenciais do banco.   |
-| POST   | `/sessions/:id/messages`     | Dispara mensagem — texto, imagem, vídeo ou documento (ver formato abaixo). |
+| POST   | `/sessions/:id/messages`     | Dispara mensagem — texto, imagem, vídeo, documento ou áudio, a um número ou grupo (ver formato abaixo). |
 | POST   | `/sessions/:id/message/sendList`    | Lista de opções — mesmo payload do `/message/sendList` da Evolution API. |
 | POST   | `/sessions/:id/message/sendButtons` | Botões — mesmo payload do `/message/sendButtons` da Evolution API.     |
 | GET    | `/sessions/:id/settings`     | Configurações da instância (`groupsIgnore`).                               |
@@ -159,9 +165,9 @@ Todos abaixo (exceto `/health`) exigem `x-api-key` no header.
 | POST   | `/sessions/:id/chat/getBase64FromMediaMessage` | Baixa a mídia de uma mensagem recebida (compatível com a Evolution). |
 | GET    | `/manager`                   | Tela de configuração (estáticos públicos; dados só com API key).         |
 
-### Enviando texto, imagem, vídeo ou documento
+### Enviando texto, imagem, vídeo, documento ou áudio
 
-`POST /sessions/:id/messages` aceita quatro formatos de corpo, selecionados pelo
+`POST /sessions/:id/messages` aceita cinco formatos de corpo, selecionados pelo
 campo `"type"` (default `"text"`, mantém compatibilidade total com o formato
 antigo):
 
@@ -196,7 +202,22 @@ antigo):
   "fileName": "nota-fiscal.pdf",   // opcional, default "arquivo"
   "caption": "legenda opcional"
 }
+
+// áudio
+{
+  "to": "5511988887777",
+  "type": "audio",
+  "mediaBase64": "<conteúdo em base64, com ou sem prefixo data:audio/...;base64,>",
+  "mimetype": "audio/ogg; codecs=opus",   // obrigatório em áudios
+  "ptt": true   // opcional, default false: true = mensagem de voz, false = arquivo de áudio
+}
 ```
+
+Áudio sem `mimetype` é recusado com `400 informe "mimetype" (obrigatório
+quando "type" é "audio")`. Para a mensagem de voz (`ptt: true`) tocar como
+gravada no aparelho, mande OGG/Opus com `"mimetype": "audio/ogg; codecs=opus"`
+— a bridge não converte formatos (não há ffmpeg na imagem). Só o booleano
+`true` liga o `ptt`; qualquer outro valor envia como arquivo de áudio.
 
 Mídia só entra **embutida no request** (`mediaBase64`) — de propósito não
 existe um `mediaUrl` que a bridge buscaria sozinha: isso abriria SSRF (fetch
@@ -234,6 +255,24 @@ mesma conta pode estar registrada com ou sem ele), e montar o JID direto dos
 dígitos que o cliente mandou podia resultar num envio "bem sucedido" (`ok:
 true`) que na verdade ia pra um JID que não existe. Se o número não estiver
 registrado no WhatsApp, a resposta é `404`.
+
+#### Enviando para um grupo
+
+Qualquer um dos formatos acima vai para um grupo trocando o `to` pelo JID do
+grupo (`^[0-9]+(-[0-9]+)?@g\.us$`):
+
+```json
+{ "to": "120363000000000001@g.us", "type": "text", "message": "Bom dia, grupo" }
+```
+
+Grupo não passa pelo `onWhatsApp()` (que só existe pra número): antes de
+enviar, a bridge confere com `groupMetadata` (a lista em memória que o Baileys
+já usa no envio, ou a consulta ao WhatsApp) que o número da sessão participa
+do grupo. Se a consulta falhar ou o número não estiver entre os participantes,
+a resposta é `404 { "error": "grupo não encontrado ou o número não participa" }`.
+O resto do fluxo é o mesmo do individual: id gerado antes do envio, gravação
+em `wa_messages` com `origin = 'api'`, evento `SEND_MESSAGE` e espera do status.
+`/message/sendList` e `/message/sendButtons` continuam só pra contato individual.
 
 ### Enviando listas e botões (payload da Evolution API)
 
@@ -370,10 +409,18 @@ curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/m
   -H "Content-Type: application/json" \
   -d '{"to": "5511988887777", "message": "Olá!"}'
 
-# 3b. dispara imagem (ver "Enviando texto, imagem, vídeo ou documento" acima pros formatos de vídeo e documento)
+# 3b. dispara imagem (ver "Enviando texto, imagem, vídeo, documento ou áudio" acima pros formatos de vídeo, documento e áudio)
 curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/messages \
   -H "Content-Type: application/json" \
   -d '{"to": "5511988887777", "type": "image", "mediaBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "mimetype": "image/png", "caption": "teste"}'
+
+# 3b'. dispara mensagem de voz (OGG/Opus em base64 no arquivo voz.b64) e texto num grupo
+curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/messages \
+  -H "Content-Type: application/json" \
+  -d "{\"to\": \"5511988887777\", \"type\": \"audio\", \"mediaBase64\": \"$(cat voz.b64)\", \"mimetype\": \"audio/ogg; codecs=opus\", \"ptt\": true}"
+curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/messages \
+  -H "Content-Type: application/json" \
+  -d '{"to": "120363000000000001@g.us", "message": "Bom dia, grupo"}'
 
 # 3c. dispara lista de opções (ver "Enviando listas e botões" acima)
 curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/message/sendList \
@@ -814,7 +861,9 @@ não bug):
 
 - **Só manda mensagem pra contato individual**, não pra grupo (`@g.us`) ou
   canal — a validação de número rejeitaria o formato de JID de grupo. Se
-  precisar disso, dá pra adicionar sem muita dificuldade.
+  precisar disso, dá pra adicionar sem muita dificuldade. *(Resolvido depois:
+  `POST /messages` aceita `to` de grupo — ver "Enviando para um grupo". Canal
+  e listas/botões pra grupo continuam fora.)*
 - **`restartRequired` é tratado à parte (reconecta na hora); os demais
   motivos de queda que não são "logged out" recebem o mesmo tratamento**
   (retry com delay fixo). A doc também documenta `badSession`,

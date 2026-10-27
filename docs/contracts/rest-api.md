@@ -157,5 +157,9 @@ Erros:
   - `type` aceita `"text" | "image" | "video" | "document" | "audio"`; fora disso, `400 { "error": "campo \"type\" inválido. Use \"text\" (default), \"image\", \"video\", \"document\" ou \"audio\"." }`.
   - `type: "audio"`: `mediaBase64` (base64 puro ou data URL, obrigatório), `mimetype` (obrigatório; voz: `audio/ogg; codecs=opus`) e `ptt` (opcional, padrão `false`; só o booleano `true` envia como mensagem de voz). Conteúdo do Baileys: `{ audio: <Buffer>, mimetype, ptt }`. Sem `mimetype` → `400 { "error": "informe \"mimetype\" (obrigatório quando \"type\" é \"audio\")" }`; `mediaBase64` ausente ou inválido → os mesmos `400` das demais mídias.
   - `/message/sendList` e `/message/sendButtons` continuam recusando grupo e `@lid` em `number`.
+- `POST /sessions/:id/messages` — citação (mudança aditiva):
+  - `quotedMessageId` (opcional, `^[A-Za-z0-9._:-]{1,128}$`): o `key.id` da mensagem a citar. A bridge lê a linha em `wa_messages` da sessão (`findMessageByKeyId`) e passa ao Baileys `quoted = { key: { remoteJid, fromMe, id, participant? }, message: { <tipo>: <só os campos string, number e boolean> } }`. Em conversa individual, `remoteJid` é o destino do envio; em grupo, o da linha.
+  - Mensagem não encontrada ou sem conteúdo reconhecível → envio **sem** citação, com aviso no log; a resposta HTTP não muda.
+  - Fora do formato → `400 { "error": "\"quotedMessageId\" inválido. Use o key.id da mensagem a citar." }`.
 - `DELETE /sessions/:id`: sem mudança de código. O CASCADE remove mensagens, webhooks e entregas.
 - `GET /sessions`: sem mudança (a tela usa o retorno atual).

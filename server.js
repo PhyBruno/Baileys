@@ -27,7 +27,7 @@ import {
   createApiMessageRegistry,
   statusName
 } from './inbound.js'
-import { saveMessage, applyProtocol, updateStatus, webhookDataFromRow, purgeOldMessages } from './messageStore.js'
+import { saveMessage, applyProtocol, updateStatus, webhookDataFromRow, purgeOldMessages, findMessageByKeyId } from './messageStore.js'
 import { createHeaderCipher } from './secrets.js'
 import { createWebhookService } from './webhooks.js'
 import { createDispatcher } from './webhookDispatcher.js'
@@ -1044,7 +1044,9 @@ app.post(
     // Participação no grupo: primeiro a lista em memória que o próprio
     // Baileys usa no envio (groupMetadata.js, validade curta); sem ela,
     // sock.groupMetadata. Evita uma consulta ao WhatsApp por mensagem.
-    cachedGroupMetadata: (sessionId, jid) => groups.cachedGroupMetadata(sessionId)(jid)
+    cachedGroupMetadata: (sessionId, jid) => groups.cachedGroupMetadata(sessionId)(jid),
+    // Citação ("quotedMessageId"): a mensagem gravada em wa_messages.
+    findQuotedMessage: (sessionId, keyId) => findMessageByKeyId(sessionId, keyId)
   })
 )
 

@@ -22,6 +22,7 @@ const PNG = Buffer.from('\u0089PNG fake image')
 let server, port
 let entry, calls
 let cachedMetadata = {}
+let storedMessages = {}
 
 function fakeSocket({ groups = {}, registered = { '5511977777777': PEER } } = {}) {
   return {
@@ -76,7 +77,12 @@ before(async () => {
         res.json({ ok: true, id: messageId, status: 'unknown' })
       },
       cachedGroupMetadata: async (id, jid) => (id === SESSION ? cachedMetadata[jid] : undefined),
-      log: { error() {} }
+      findQuotedMessage: async (id, keyId) => {
+        calls.findQuoted.push({ id, keyId })
+        if (keyId === 'QUEBRA') throw new Error('banco fora')
+        return storedMessages[keyId] ?? null
+      },
+      log: { error() {}, warn() {} }
     })
   )
   server = http.createServer(app)
@@ -98,9 +104,11 @@ beforeEach(() => {
     waitForStatus: [],
     cacheSentMessage: [],
     recordApiMessage: [],
+    findQuoted: [],
     marked: []
   }
   cachedMetadata = {}
+  storedMessages = {}
   setSocket(fakeSocket())
 })
 
@@ -366,6 +374,97 @@ test('(h) recusas existentes inalteradas', async () => {
     const res = await send(body)
     assert.equal(res.status, 400, JSON.stringify(body))
     assert.deepEqual(res.body, expected)
+  }
+  assertNothingSent()
+})
+
+// ----------------------------------------------------------- (i) citação
+
+// Linha de wa_messages como o messageStore grava (key normalizada, message em JSON comum).
+function linha(keyId, { remoteJid = PEER, fromMe = false, participant, message = { conversation: 'Segue o comprovante?' } } = {}) {
+  return {
+    key_id: keyId,
+    from_me: fromMe,
+    remote_jid: remoteJid,
+    key: { remoteJid, fromMe, id: keyId, ...(participant ? { participant } : {}) },
+    message
+  }
+}
+
+test('(i) quotedMessageId de mensagem gravada sai como quoted no sendMessage', async () => {
+  storedMessages = { '3EB0CITADA01': linha('3EB0CITADA01') }
+  const res = await send({ to: '5511977777777', message: 'Recebido!', quotedMessageId: '3EB0CITADA01' })
+  const sent = assertCommonFlow(res, PEER)
+  assert.deepEqual(calls.findQuoted, [{ id: SESSION, keyId: '3EB0CITADA01' }])
+  assert.deepEqual(sent.options.quoted, {
+    key: { remoteJid: PEER, fromMe: false, id: '3EB0CITADA01' },
+    message: { conversation: 'Segue o comprovante?' }
+  })
+  assert.equal(sent.options.messageId, calls.marked[0])
+})
+
+test('(i) citação de mídia leva só os campos de texto, sem bytes nem contextInfo', async () => {
+  storedMessages = {
+    '3EB0FOTO': linha('3EB0FOTO', {
+      fromMe: true,
+      message: {
+        imageMessage: {
+          caption: 'nota fiscal',
+          mimetype: 'image/jpeg',
+          mediaKey: { type: 'Buffer', data: [1, 2, 3] },
+          jpegThumbnail: '/9j/4AAQ',
+          contextInfo: { stanzaId: 'X' }
+        }
+      }
+    })
+  }
+  const res = await send({ to: '5511977777777', type: 'audio', mediaBase64: OGG_DATA_URL, mimetype: 'audio/ogg', ptt: true, quotedMessageId: '3EB0FOTO' })
+  const sent = assertCommonFlow(res, PEER)
+  assert.deepEqual(sent.options.quoted.message, { imageMessage: { caption: 'nota fiscal', mimetype: 'image/jpeg', jpegThumbnail: '/9j/4AAQ' } })
+  assert.equal(sent.options.quoted.key.fromMe, true)
+})
+
+test('(i) em grupo a citação leva o participant e o remoteJid do grupo', async () => {
+  setSocket(fakeSocket({ groups: { [GROUP]: groupWith({ id: '5511900000001@s.whatsapp.net' }) } }))
+  storedMessages = { '3EB0GRUPO': linha('3EB0GRUPO', { remoteJid: GROUP, participant: PEER }) }
+  const res = await send({ to: GROUP, message: 'oi', quotedMessageId: '3EB0GRUPO' })
+  const sent = assertCommonFlow(res, GROUP)
+  assert.deepEqual(sent.options.quoted.key, { remoteJid: GROUP, fromMe: false, id: '3EB0GRUPO', participant: PEER })
+})
+
+test('(i) conversa individual: a citação é da própria conversa, mesmo com a linha em LID', async () => {
+  storedMessages = { '3EB0LID': linha('3EB0LID', { remoteJid: '98765432100000@lid' }) }
+  const res = await send({ to: '5511977777777', message: 'oi', quotedMessageId: '3EB0LID' })
+  const sent = assertCommonFlow(res, PEER)
+  assert.equal(sent.options.quoted.key.remoteJid, PEER)
+})
+
+test('(i) mensagem citada desconhecida ou leitura com erro: envia sem citação', async () => {
+  for (const quotedMessageId of ['3EB0SUMIU', 'QUEBRA']) {
+    beforeEachReset()
+    const res = await send({ to: '5511977777777', message: 'oi', quotedMessageId })
+    const sent = assertCommonFlow(res, PEER)
+    assert.equal('quoted' in sent.options, false, quotedMessageId)
+  }
+})
+
+test('(i) linha sem conteúdo reconhecível: envia sem citação', async () => {
+  storedMessages = { '3EB0VAZIA': linha('3EB0VAZIA', { message: {} }) }
+  const sent = assertCommonFlow(await send({ to: '5511977777777', message: 'oi', quotedMessageId: '3EB0VAZIA' }), PEER)
+  assert.equal('quoted' in sent.options, false)
+})
+
+test('(i) sem quotedMessageId não consulta a mensagem citada', async () => {
+  const sent = assertCommonFlow(await send({ to: '5511977777777', message: 'oi', quotedMessageId: null }), PEER)
+  assert.equal(calls.findQuoted.length, 0)
+  assert.equal('quoted' in sent.options, false)
+})
+
+test('(i) quotedMessageId inválido → 400 sem enviar', async () => {
+  for (const quotedMessageId of ['', 42, 'tem espaço', 'x'.repeat(129), { id: 'A' }]) {
+    const res = await send({ to: '5511977777777', message: 'oi', quotedMessageId })
+    assert.equal(res.status, 400, JSON.stringify(quotedMessageId))
+    assert.deepEqual(res.body, { error: '"quotedMessageId" inválido. Use o key.id da mensagem a citar.' })
   }
   assertNothingSent()
 })

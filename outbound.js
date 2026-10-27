@@ -15,6 +15,10 @@ export const NUMBER_FORMAT = /^\d{8,15}$/
 // WhatsApp, o atual (120363...@g.us) e o antigo (<criador>-<timestamp>@g.us).
 export const GROUP_JID_FORMAT = /^[0-9]+(-[0-9]+)?@g\.us$/
 
+// JID de usuário em LID aceito em "to" (só na rota /messages), com ou sem
+// sufixo de dispositivo ":N" (ex: 123456789012345@lid ou 123456789012345:3@lid).
+export const LID_JID_FORMAT = /^[0-9]+(:[0-9]+)?@lid$/
+
 export const MESSAGE_TYPES = ['text', 'image', 'video', 'document', 'audio']
 
 export function normalizeNumber(raw) {
@@ -52,14 +56,19 @@ export function decodeBase64Media(raw) {
   return Buffer.from(cleaned, 'base64')
 }
 
-// Destino do campo "to": { number } (dígitos com DDI), { group } (JID de
-// grupo) ou null. Qualquer outro JID (@s.whatsapp.net, @lid, @newsletter,
-// @broadcast) é recusado: antes, normalizeNumber() tirava o sufixo e o JID
-// passava como se fosse um número.
+// Destino do campo "to": { number } (dígitos com DDI ou JID @s.whatsapp.net),
+// { lid } (JID @lid, sem o sufixo de dispositivo), { group } (JID de grupo) ou
+// null. Os demais JIDs (@newsletter, @broadcast etc.) são recusados: antes,
+// normalizeNumber() tirava o sufixo e o JID passava como se fosse um número.
 export function parseSendTarget(to) {
   if (typeof to !== 'string' && typeof to !== 'number') return null
   const raw = String(to).trim()
-  if (raw.includes('@')) return GROUP_JID_FORMAT.test(raw) ? { group: raw } : null
+  if (GROUP_JID_FORMAT.test(raw)) return { group: raw }
+  if (LID_JID_FORMAT.test(raw)) return { lid: jidNormalizedUser(raw) }
+  if (raw.includes('@')) {
+    const number = parseRecipientNumber(raw)
+    return number ? { number } : null
+  }
   const digits = normalizeNumber(raw)
   return NUMBER_FORMAT.test(digits) ? { number: digits } : null
 }
@@ -174,8 +183,9 @@ export function createSendMessageHandler({
     if (!target) {
       return res.status(400).json({
         error: String(body.to).includes('@')
-          ? 'formato de "to" inválido. Use apenas dígitos com DDI (ex: 5511999999999) ou o JID de um grupo ' +
-            '(ex: 120363000000000001@g.us). @s.whatsapp.net, @lid e @newsletter não são aceitos.'
+          ? 'formato de "to" inválido. Use dígitos com DDI (ex: 5511999999999), o JID de usuário ' +
+            '(ex: 5511999999999@s.whatsapp.net ou 123456789012345@lid) ou o JID de um grupo ' +
+            '(ex: 120363000000000001@g.us). @newsletter e @broadcast não são aceitos.'
           : 'formato de "to" inválido. Use apenas dígitos com DDI, ex: 5511999999999'
       })
     }
@@ -196,6 +206,10 @@ export function createSendMessageHandler({
           return res.status(404).json({ error: 'grupo não encontrado ou o número não participa' })
         }
         jid = target.group
+      } else if (target.lid) {
+        // LID: o onWhatsApp() não aceita LID (o Baileys ignora com um aviso),
+        // e o LID é opaco e já canônico, sem a ambiguidade do 9. Vai direto.
+        jid = target.lid
       } else {
         // Não confiamos no formato de dígitos que o cliente mandou pra montar o
         // JID na mão. Números brasileiros têm o "9" adicional ambíguo (uma conta

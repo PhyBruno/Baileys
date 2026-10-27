@@ -5,7 +5,7 @@
 // cache de retry, gravação em wa_messages, espera de status) chegam por
 // createSendMessageHandler.
 
-import { jidNormalizedUser } from 'baileys'
+import { getContentType, isJidGroup, jidNormalizedUser, normalizeMessageContent } from 'baileys'
 
 // Formato aceito para o ID da sessão e para o destinatário de mensagens:
 // apenas dígitos, com DDI incluído (ex: 5511999999999). Nada de "+", espaço ou "-".
@@ -91,6 +91,38 @@ function normalizedJid(jid) {
   return jidNormalizedUser(jid) || null
 }
 
+// "quotedMessageId" opcional: o key.id da mensagem a citar, como veio no webhook.
+const QUOTED_ID_FORMAT = /^[A-Za-z0-9._:-]{1,128}$/
+
+// Mensagem citada no formato do "quoted" do Baileys, a partir da linha de
+// wa_messages: { key, message } ou null (linha sem conteúdo reconhecível).
+// A cópia do conteúdo leva só os campos de texto (texto, legenda, nome do
+// arquivo, mimetype): a linha é JSON comum, sem os bytes da mídia (mediaKey,
+// thumbnail), e o WhatsApp acha a original pelo stanzaId — a cópia só dá o
+// trecho que aparece em cima da resposta. Em conversa individual a citação é
+// da própria conversa (remoteJid = destino); em grupo, do grupo da linha.
+export function quotedFromRow(row, jid) {
+  const inner = row?.message && typeof row.message === 'object' ? normalizeMessageContent(row.message) : null
+  const type = inner ? getContentType(inner) : undefined
+  if (!row?.key_id || !type) return null
+  const content = inner[type]
+  const copy =
+    typeof content === 'string'
+      ? content
+      : Object.fromEntries(
+          Object.entries(content ?? {}).filter(([, v]) => ['string', 'number', 'boolean'].includes(typeof v))
+        )
+  return {
+    key: {
+      remoteJid: isJidGroup(jid) ? row.key?.remoteJid ?? jid : jid,
+      fromMe: Boolean(row.from_me),
+      id: row.key_id,
+      ...(row.key?.participant ? { participant: row.key.participant } : {})
+    },
+    message: { [type]: copy }
+  }
+}
+
 // Conteúdo do sock.sendMessage a partir do corpo: { content } ou { error } (400).
 export function buildMessageContent({ type = 'text', message, mediaBase64, mimetype, fileName, caption, ptt } = {}) {
   if (!MESSAGE_TYPES.includes(type)) {
@@ -150,6 +182,8 @@ export function buildMessageContent({ type = 'text', message, mediaBase64, mimet
  * respondWithMessageStatus(res, id, statusPromise)
  * cachedGroupMetadata(id, groupJid)   → metadata do grupo em memória, ainda válido, ou
  *                                       undefined (aí consulta sock.groupMetadata). Opcional.
+ * findQuotedMessage(id, keyId)        → linha de wa_messages da mensagem citada, ou null.
+ *                                       Opcional.
  */
 export function createSendMessageHandler({
   getConnectedEntry,
@@ -159,6 +193,7 @@ export function createSendMessageHandler({
   recordApiMessage,
   respondWithMessageStatus,
   cachedGroupMetadata = async () => undefined,
+  findQuotedMessage = async () => null,
   log = console
 }) {
   // Falha da consulta (grupo inexistente, número removido, sem permissão) vira
@@ -188,6 +223,11 @@ export function createSendMessageHandler({
             '(ex: 120363000000000001@g.us). @newsletter e @broadcast não são aceitos.'
           : 'formato de "to" inválido. Use apenas dígitos com DDI, ex: 5511999999999'
       })
+    }
+    if (body.quotedMessageId !== undefined && body.quotedMessageId !== null) {
+      if (typeof body.quotedMessageId !== 'string' || !QUOTED_ID_FORMAT.test(body.quotedMessageId)) {
+        return res.status(400).json({ error: '"quotedMessageId" inválido. Use o key.id da mensagem a citar.' })
+      }
     }
     const built = buildMessageContent(body)
     if (built.error) return res.status(400).json({ error: built.error })
@@ -232,10 +272,23 @@ export function createSendMessageHandler({
       // (messages.upsert 'append') num nextTick antes de retornar, e o
       // listener precisa reconhecer esse eco como 'api' (research R4). O
       // ...options do Baileys sobrescreve o id que ele geraria sozinho.
+      // Citação: a mensagem precisa estar gravada nesta sessão. Sem ela (apagada
+      // pela retenção, ou anterior à bridge), a resposta sai sem citação — não
+      // vale perder a mensagem do atendente por isso.
+      let quoted = null
+      if (body.quotedMessageId) {
+        try {
+          quoted = quotedFromRow(await findQuotedMessage(id, body.quotedMessageId), jid)
+        } catch (err) {
+          log.error(`[${id}] falha ao ler a mensagem citada ${body.quotedMessageId}: ${err.message}`)
+        }
+        if (!quoted) log.warn?.(`[${id}] mensagem citada ${body.quotedMessageId} não encontrada; envio sem citação`)
+      }
+
       const messageId = generateMessageId(entry.sock.user.id)
       entry.apiMessageIds.mark(messageId)
 
-      const result = await entry.sock.sendMessage(jid, built.content, { messageId })
+      const result = await entry.sock.sendMessage(jid, built.content, { messageId, ...(quoted ? { quoted } : {}) })
       const statusPromise = waitForStatus(entry.sock, result?.key?.id)
       cacheSentMessage(entry, result?.key?.id, result?.message)
       recordApiMessage(id, entry, result).catch((err) =>

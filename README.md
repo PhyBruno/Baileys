@@ -221,6 +221,23 @@ gravada no aparelho, mande OGG/Opus com `"mimetype": "audio/ogg; codecs=opus"`
 — a bridge não converte formatos (não há ffmpeg na imagem). Só o booleano
 `true` liga o `ptt`; qualquer outro valor envia como arquivo de áudio.
 
+#### Respondendo (citando) uma mensagem
+
+Qualquer um dos cinco formatos aceita `quotedMessageId`, o `key.id` da
+mensagem a citar (o mesmo do webhook), e a mensagem sai como resposta a ela:
+
+```json
+{ "to": "5511988887777", "message": "Recebido!", "quotedMessageId": "3EB0A1B2C3D4E5F60718" }
+```
+
+A mensagem citada precisa estar gravada nesta sessão (`wa_messages`, recebida
+ou enviada). A bridge cita com o `key` dela e uma cópia só dos campos de texto
+do conteúdo (texto, legenda, nome do arquivo). Em grupo, o autor citado é o
+`participant` da linha. Se a mensagem não for encontrada (apagada pela
+`MESSAGE_RETENTION_DAYS` ou anterior à bridge), o envio sai **sem citação**,
+em vez de falhar. `quotedMessageId` que não seja string de 1 a 128 caracteres
+(`A-Z a-z 0-9 . _ : -`) é recusado com 400.
+
 Mídia só entra **embutida no request** (`mediaBase64`) — de propósito não
 existe um `mediaUrl` que a bridge buscaria sozinha: isso abriria SSRF (fetch
 de URL arbitrária vinda de qualquer cliente que tenha a API key global). Se
